@@ -12,6 +12,10 @@ workspace = true
 # LanceDB's default feature set is empty, which keeps its optional candle/hf-hub
 # embedding stack out of the tree -- we do our own inference via ort.
 lancedb = "0.37"
+# Must track the arrow major that lancedb is built against, for the same
+# reason lance-index is pinned below: two arrow versions in the tree give
+# RecordBatch two distinct identities and every conversion stops compiling.
+# Dependabot is told not to major-bump these in .github/dependabot.yml.
 arrow = "58"
 arrow-schema = "58"
 # FullTextSearchQuery is not re-exported by lancedb, so this comes in directly.
