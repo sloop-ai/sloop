@@ -7,6 +7,14 @@ updates:
     cooldown:
       default-days: 7
     open-pull-requests-limit: 5
+    # arrow and arrow-schema are coupled to the arrow major that lancedb is
+    # built against. A major bump compiles two arrow versions into one tree and
+    # RecordBatch stops being one type. Bump these only alongside lancedb.
+    ignore:
+      - dependency-name: arrow
+        update-types: ["version-update:semver-major"]
+      - dependency-name: arrow-schema
+        update-types: ["version-update:semver-major"]
     groups:
       cargo:
         patterns: ["*"]
