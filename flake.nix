@@ -71,7 +71,12 @@
               ];
             };
 
-            cargoLock.lockFile = ./Cargo.lock;
+            # cargoHash with fetchCargoVendor, NOT cargoLock.lockFile.
+            # nixpkgs' importCargoLock fetches crates from crates.io's /api/v1
+            # endpoint, which crates.io rate-limits. Cargo's own vendoring uses
+            # the sparse registry plus the static.crates.io CDN, which is not.
+            # Update this hash whenever Cargo.lock changes.
+            cargoHash = "sha256-ynPt05OwIza/EvgdovC/SV+3auSPyzk0IW5qe+WAvz0=";
             cargoBuildFlags = [ "-p" "sloop-memory" ];
 
             # protoc is build-time codegen for lance-encoding's .proto files,
