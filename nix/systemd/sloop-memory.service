@@ -1,0 +1,33 @@
+# systemd user unit for the sloop-memory daemon.
+#
+# Copy to ~/.config/systemd/user/sloop-memory.service and replace the roots
+# below. %h expands to your home directory, so paths under it need no editing.
+#
+# Then:  systemctl --user daemon-reload
+#        systemctl --user enable --now sloop-memory
+# Check: sloop-memory status
+#        journalctl --user -u sloop-memory -f
+
+[Unit]
+Description=sloop-memory: hybrid local search over private markdown roots
+Documentation=https://github.com/sloop-ai/sloop
+After=default.target
+
+[Service]
+Type=simple
+
+# Adjust to the installed path if it is not on the nix profile path.
+ExecStart=%h/.nix-profile/bin/sloop-memory daemon
+
+# A user unit inherits nothing from your shell, so the roots must be spelled
+# out here. This is the one value the package cannot bake in; ORT_DYLIB_PATH
+# and SLOOP_MEMORY_MODEL are already baked into the wrapped binary.
+Environment=SLOOP_MEMORY_ROOTS=notes=%h/notes
+
+# The hook fails open, so a daemon that dies takes the feature with it
+# silently. Restart rather than leave it down.
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

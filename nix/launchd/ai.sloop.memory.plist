@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd agent for the sloop-memory daemon.
+
+  Copy to ~/Library/LaunchAgents/ai.sloop.memory.plist and replace every
+  REPLACE_ME below. launchd does not expand ~ or $HOME in any of these
+  values, so every path must be absolute.
+
+  Then:  launchctl load ~/Library/LaunchAgents/ai.sloop.memory.plist
+  Check: sloop-memory status
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ai.sloop.memory</string>
+
+  <!-- Absolute path to the installed binary. `which sloop-memory` after
+       `nix profile install` gives you this. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>REPLACE_ME/bin/sloop-memory</string>
+    <string>daemon</string>
+  </array>
+
+  <!-- A launchd agent inherits nothing from your shell, so the roots must be
+       spelled out here. This is the one value the package cannot bake in.
+       ORT_DYLIB_PATH and SLOOP_MEMORY_MODEL are already baked into the wrapped
+       binary and do not belong here. -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>SLOOP_MEMORY_ROOTS</key>
+    <string>notes=REPLACE_ME/notes</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <!-- The hook fails open, so a daemon that dies takes the feature with it
+       silently. These logs are the only place that shows up. -->
+  <key>StandardOutPath</key>
+  <string>REPLACE_ME/Library/Logs/sloop-memory.log</string>
+  <key>StandardErrorPath</key>
+  <string>REPLACE_ME/Library/Logs/sloop-memory.log</string>
+</dict>
+</plist>

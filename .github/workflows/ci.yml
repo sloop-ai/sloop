@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# The default token needs nothing here; jobs only read the checkout.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Everything runs inside `nix develop`, so CI uses the same pinned toolchain
+  # a contributor gets. Running on Linux as well as macOS is what keeps the
+  # flake's cross-platform claim honest.
+  check:
+    name: check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+
+      # Caches ~/.cargo and target/. The nix store itself comes from
+      # cache.nixos.org, so only the crate graph is worth caching here.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: cargo fmt
+        run: nix develop -c cargo fmt --check
+
+      - name: cargo clippy
+        run: nix develop -c cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: cargo test
+        run: nix develop -c cargo test --workspace
+
+  # Evaluation only -- catches a broken flake in seconds without compiling.
+  flake:
+    name: flake eval
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+
+      - name: nix flake check
+        run: nix flake check --all-systems --no-build
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check advisories licenses bans sources
+
+  # The installable artifact. Sandboxed, so it cannot reuse the cargo cache
+  # above and compiles the whole dependency tree -- too slow for every PR, but
+  # main must never ship a package that does not build.
+  package:
+    name: nix build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+
+      - name: nix build
+        run: nix build .#sloop-memory --print-out-paths
+
+      - name: binary runs with nothing but roots set
+        run: |
+          set -euo pipefail
+          out=$(nix build .#sloop-memory --no-link --print-out-paths)
+          work=$(mktemp -d)
+          mkdir -p "$work/notes"
+          printf -- '---\ncaptured: 2026-04-10\n---\n\n# Cache tuning\n\nThe debouncer coalesces writes over a 4 second window.\n' \
+            > "$work/notes/caching.md"
+          env -i HOME="$HOME" PATH=/usr/bin:/bin \
+            SLOOP_MEMORY_ROOTS="notes=$work/notes" \
+            SLOOP_MEMORY_STATE="$work/state" \
+            "$out/bin/sloop-memory" index
+          env -i HOME="$HOME" PATH=/usr/bin:/bin \
+            SLOOP_MEMORY_ROOTS="notes=$work/notes" \
+            SLOOP_MEMORY_STATE="$work/state" \
+            "$out/bin/sloop-memory" status

@@ -1,0 +1,11 @@
+# The single source of truth for the toolchain version, read by both nix and
+# rustup. The flake feeds this file to rust-overlay; a contributor without nix
+# gets the same release because rustup reads it directly.
+#
+# Every component must come from one release. Mixing sources -- nixpkgs' clippy
+# alongside a rustup cargo -- gave clippy-driver a different rustc identity from
+# the cargo doing the building, and every cached dependency .rmeta was rejected
+# with E0514.
+[toolchain]
+channel = "1.98.0"
+components = ["cargo", "clippy", "rustfmt", "rust-src"]

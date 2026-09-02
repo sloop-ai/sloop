@@ -1,0 +1,27 @@
+[package]
+name = "sloop-memory"
+description = "Resident daemon, MCP server, and prompt-hook client for private markdown search"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "sloop-memory"
+path = "src/main.rs"
+
+[dependencies]
+sloop-memory-core.workspace = true
+lancedb = "0.37"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "signal", "time"] }
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+# FSEvents on macOS. The debouncer matters more than the watcher: Obsidian
+# autosaves every few seconds and rewrites .obsidian state on every pane change.
+notify-debouncer-full = "0.7"
+chrono = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

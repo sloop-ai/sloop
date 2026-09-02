@@ -1,0 +1,38 @@
+[package]
+name = "sloop-memory-core"
+description = "Hybrid local search library: chunking, indexing, embedding, and storage over private markdown roots"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# LanceDB's default feature set is empty, which keeps its optional candle/hf-hub
+# embedding stack out of the tree -- we do our own inference via ort.
+lancedb = "0.37"
+arrow = "58"
+arrow-schema = "58"
+# FullTextSearchQuery is not re-exported by lancedb, so this comes in directly.
+# Version must track lancedb's own `=10.0.0` pin exactly or the types diverge.
+lance-index = "=10.0.0"
+
+# load-dynamic dlopens libonnxruntime at runtime rather than linking it, so the
+# build needs no C++ toolchain and nix can point ORT_DYLIB_PATH at its own copy.
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["load-dynamic"] }
+# A regex backend is mandatory even for WordPiece models like bge; fancy-regex is
+# the pure-Rust one, so this stays free of the onig C dependency.
+tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "signal", "time"] }
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+sha2 = "0.10"
+walkdir = "2"
+chrono = "0.4"
+
+[dev-dependencies]
+tempfile = "3"

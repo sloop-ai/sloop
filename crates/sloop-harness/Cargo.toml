@@ -1,0 +1,12 @@
+[package]
+name = "sloop-harness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Branching agent harness over the Messages API"
+
+[dependencies]
+sloop-memory-core.workspace = true
+
+[lints]
+workspace = true
