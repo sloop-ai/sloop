@@ -58,6 +58,23 @@ jobs:
       - name: nix flake check
         run: nix flake check --all-systems --no-build
 
+  # cargoHash pins the vendored crate set. A Cargo.lock change invalidates it,
+  # and the `package` job below only runs on push -- so without this a stale
+  # hash would land on main before anything noticed. Building just the vendor
+  # derivation checks the hash without compiling anything.
+  vendor:
+    name: cargo vendor hash
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+
+      - name: verify cargoHash
+        run: nix build .#sloop-memory.cargoDeps --no-link
+
   deny:
     name: cargo-deny
     runs-on: ubuntu-latest
