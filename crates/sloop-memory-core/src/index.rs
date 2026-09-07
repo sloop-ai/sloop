@@ -6,6 +6,7 @@
 //! watcher can ask about three paths without scanning everything.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -31,10 +32,23 @@ pub struct IndexStats {
     pub post_index_ms: u64,
 }
 
+/// Lowercase hex, written out rather than taken from the digest's `LowerHex`
+/// impl -- `RustCrypto` dropped that in 0.11. These strings are manifest keys, so
+/// the encoding is pinned by a known-answer test below: a change to it would
+/// invalidate every entry and silently re-embed every root, which no compile
+/// error would catch.
+fn hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(bytes);
-    format!("{:x}", h.finalize())
+    hex(&h.finalize())
 }
 
 /// File content plus the chunker version, so that changing how notes are split
@@ -43,7 +57,7 @@ fn content_hash(raw: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(chunk::CHUNKER_VERSION.to_le_bytes());
     h.update(raw);
-    format!("{:x}", h.finalize())
+    hex(&h.finalize())
 }
 
 #[must_use]
@@ -334,6 +348,40 @@ pub async fn reindex_all(
 // Tests are allowed to panic; a failing unwrap/expect *is* the assertion.
 #[expect(clippy::unwrap_used, reason = "see comment above")]
 mod tests {
+
+    /// Known-answer test for the hex encoding. `sha256_hex` output is the
+    /// manifest key for every indexed file, so a change here silently
+    /// invalidates the whole manifest and re-embeds every root -- an expensive
+    /// no-op that reports success. The RFC 6234 vector for "abc" pins it to
+    /// something outside this repo.
+    #[test]
+    fn sha256_hex_matches_the_published_vector() {
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    /// Every byte must render as exactly two lowercase digits. A `{:x}` per
+    /// byte drops the leading zero on anything under 0x10, which shortens the
+    /// string and silently changes every key it appears in.
+    #[test]
+    fn hex_pads_every_byte_to_two_digits() {
+        assert_eq!(hex(&[0x00, 0x0f, 0xa0, 0xff]), "000fa0ff");
+        assert_eq!(hex(&[]), "");
+    }
+
+    /// The chunker version is mixed into the content hash, so bumping it has
+    /// to change the hash of identical bytes -- that is the whole mechanism
+    /// for re-splitting notes without anyone passing `--full`.
+    #[test]
+    fn content_hash_differs_from_a_plain_digest_of_the_same_bytes() {
+        assert_ne!(content_hash(b"abc"), sha256_hex(b"abc"));
+    }
     use super::*;
     use futures::TryStreamExt;
     use lancedb::query::{ExecutableQuery, QueryBase, Select};
