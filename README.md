@@ -25,12 +25,16 @@ it needs the notes -- that kind of trigger fails silently on questions that do
 not announce themselves.  This is deliberately separate so it can be embedded
 into any harness.
 
-`sloop-harness` is meant to handle the other half, and does not yet. Feeding a
-transcript back into the index is only safe if you can tell what the transcript
-*concluded* from what it *rejected*. A branching harness records which branches
-were kept and which were abandoned, so a labeled rejection stays distinguishable
-from a conclusion -- and that label is what would make discarded reasoning safe
-to index, rather than turning every rejected idea into a retrievable fact.
+`sloop-harness` is meant to handle the other half. Feeding a transcript back
+into the index is only safe if you can tell what the transcript *concluded*
+from what it *rejected*. A branching harness records which branches were kept
+and which were abandoned, so a labeled rejection stays distinguishable from a
+conclusion -- and that label is what would make discarded reasoning safe to
+index, rather than turning every rejected idea into a retrievable fact.
+
+It holds a conversation tree today: nodes are content blocks, each carries a
+kept / abandoned / pending label, and any branch replays to a `messages[]`
+array. What it does not yet have is the client that would send one.
 
 ## The parts
 
@@ -38,7 +42,7 @@ to index, rather than turning every rejected idea into a retrievable fact.
 |---|---|
 | [`sloop-memory-core`](crates/sloop-memory-core) | Library. Chunking, embedding, index building, hybrid retrieval, and the daemon's socket protocol. |
 | [`sloop-memory`](crates/sloop-memory) | Binary. A resident daemon with a filesystem watcher, an MCP server, a CLI, and a Claude Code prompt hook. |
-| [`sloop-harness`](crates/sloop-harness) | Binary. A branching agent harness over the Anthropic Messages API. Scaffold only. |
+| [`sloop-harness`](crates/sloop-harness) | Binary. A branching agent harness over the Anthropic Messages API. Has the conversation tree; no client yet. |
 
 The library/binary split exists so a consumer can link the engine directly and
 call it in-process instead of standing up a daemon and talking to it over a Unix

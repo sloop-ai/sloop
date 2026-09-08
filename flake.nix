@@ -76,7 +76,7 @@
             # endpoint, which crates.io rate-limits. Cargo's own vendoring uses
             # the sparse registry plus the static.crates.io CDN, which is not.
             # Update this hash whenever Cargo.lock changes.
-            cargoHash = "sha256-QrI+87TMnXW0gTPB3CAxh5C7kF0upfTNg85kqL8jC5s=";
+            cargoHash = "sha256-xyGTP/jjD6u5546bfpGe+GEhyi0S6437BEM5z8NDAe8=";
             cargoBuildFlags = [ "-p" "sloop-memory" ];
 
             # protoc is build-time codegen for lance-encoding's .proto files,

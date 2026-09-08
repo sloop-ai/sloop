@@ -7,6 +7,16 @@ description = "Branching agent harness over the Messages API"
 
 [dependencies]
 sloop-memory-core.workspace = true
+# Replay emits the /v1/messages content shape -- {"type": "text", ...} -- so the
+# wire format lives in the types rather than in a hand-written serializer.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+# Fork placement is the axis where generated cases beat hand-picked ones: the
+# replay properties must hold wherever the forks sit, not only where a test
+# author thought to put one.
+proptest = "1"
 
 [lints]
 workspace = true
