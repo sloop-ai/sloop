@@ -95,9 +95,21 @@ why the error message for a missing model names the wrapped binary: a raw
 
 ## What this does not cover
 
-`sloop-harness` is a scaffold. The conversation tree, forking at content-block
-boundaries, branch replay, and kept/abandoned status are unbuilt, and their
-design is not settled. See that crate's README for the two constraints already
-known to shape it -- there is no official Anthropic SDK for Rust, and assistant
-prefill was removed from current models, which is why the tree's nodes have to
-be content blocks rather than whole messages.
+`sloop-harness` now holds a conversation tree: nodes are content blocks,
+carry a kept / abandoned / pending label, and replay to a `messages[]` array.
+Its README covers the model. What is still unbuilt there is everything that
+touches the outside world -- the HTTP client for `/v1/messages`, and with it
+API keys and cost -- plus block kinds beyond text, cache-hit instrumentation,
+and indexing a transcript back into `sloop-memory`.
+
+Two constraints shape that crate and are worth repeating here, because both
+are external facts rather than choices. There is no official Anthropic SDK for
+Rust, so the client will talk raw HTTP. And assistant prefill was removed from
+current models, which is why the tree's nodes have to be content blocks rather
+than whole messages: a branch cannot resume a truncated turn, so it must be
+able to name the block boundary it regenerates from.
+
+The harness still reaches only for `config` and `index`. The tree itself needs
+nothing from the engine at all, which is the expected shape -- the link exists
+so that indexing a transcript, when it arrives, is an in-process call rather
+than a socket round trip.
