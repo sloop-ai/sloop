@@ -18,6 +18,7 @@ use std::path::Path;
 use sloop_memory_core::config::{db_dir, TABLE_CHUNKS};
 use sloop_memory_core::index::is_indexable;
 
+mod api;
 mod tree;
 
 use tree::{ContentBlock, Role, Status, Tree};
