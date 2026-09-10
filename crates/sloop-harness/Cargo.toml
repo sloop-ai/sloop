@@ -11,6 +11,27 @@ sloop-memory-core.workspace = true
 # wire format lives in the types rather than in a hand-written serializer.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# There is no official Anthropic SDK for Rust, so this talks raw HTTP. reqwest,
+# hyper, rustls and ring are already in the lock file by way of the lance tree,
+# so taking reqwest directly adds no crate and no license that is not already
+# vendored. rustls rather than native-tls keeps the build free of a system
+# OpenSSL on linux.
+reqwest = { version = "0.12", default-features = false, features = [
+  "charset",
+  "http2",
+  "json",
+  "rustls-tls-native-roots",
+  "stream",
+] }
+# bytes_stream() yields a futures Stream; StreamExt::next is how it is read.
+futures = "0.3"
+# macros is for the #[tokio::main] the binary will take, and the runtime is
+# multi-thread because sloop-memory-core's lancedb work is async too.
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# snafu is the house rule, but the harness reports failures to a person at a
+# terminal rather than to a caller that branches on them, so a typed enum would
+# buy a decision nothing makes. Both sibling crates already use anyhow.
+anyhow = "1"
 
 [dev-dependencies]
 # Fork placement is the axis where generated cases beat hand-picked ones: the
