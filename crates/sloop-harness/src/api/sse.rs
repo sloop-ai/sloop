@@ -10,9 +10,12 @@
 
 // Nothing outside the tests calls any of this until `Api::send` has a socket
 // to read from. `pub` exempts nothing in a binary crate, so the whole module
-// needs the label, and it goes once that caller exists. not(test) because
-// under cfg(test) every item here is live and an expectation that held there
-// would itself go unfulfilled.
+// needs the label, and it goes once that caller exists. The not(test) guard
+// records which build the label is about -- under cfg(test) the tests reach
+// every item, so none of it is dead there. It is documentation rather than a
+// tripwire: rustc does not report an unfulfilled `dead_code` expectation, so
+// an unconditional attribute would sit just as quiet over a module that had
+// stopped being dead.
 #![cfg_attr(not(test), expect(dead_code, reason = "see above"))]
 
 use anyhow::{ensure, Context, Result};
@@ -145,6 +148,11 @@ pub enum Event {
 }
 
 /// The opening shape of a block, which is what says how to accumulate it.
+///
+/// Only the kind survives, and whatever content the opening carried is
+/// dropped. That is safe because the API opens every block empty and sends
+/// the contents as deltas, so there is nothing there to lose -- an invariant
+/// of the wire rather than of this type, which is why it is written down.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BlockStart {
@@ -156,8 +164,11 @@ pub enum BlockStart {
     Other,
 }
 
+// No `rename_all` beside the tag, unlike the two enums above: a delta's wire
+// name is its kind plus `_delta`, which no case convention produces, so every
+// variant has to name itself and there is nothing left to rename.
 #[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type")]
 pub enum Delta {
     #[serde(rename = "text_delta")]
     Text { text: String },
@@ -172,6 +183,14 @@ pub enum Delta {
     Other,
 }
 
+/// The tail of a message, which is where the stop reason arrives.
+///
+/// `stop_reason` stays a `String` beside four hand-rolled tagged enums, and
+/// `end_turn`/`max_tokens`/`refusal` is exactly the closed set this file
+/// models as an enum everywhere else. It is a string because its only reader
+/// compares it against a single literal; the moment a second reader branches
+/// on it, it should become an enum first. [`ApiError::kind`] is the same
+/// choice for the same reason.
 #[derive(Debug, Deserialize)]
 pub struct MessageDelta {
     pub stop_reason: Option<String>,
@@ -188,7 +207,7 @@ pub struct ApiError {
 #[expect(
     clippy::unwrap_used,
     clippy::panic,
-    reason = "a test reports a failure by panicking"
+    reason = "a test reports failure by panicking, and an unwrap is one way"
 )]
 mod tests {
     use super::{data_of, BlockStart, Delta, Event, FrameDecoder, MAX_BUFFERED};
@@ -434,7 +453,7 @@ mod tests {
     }
 
     #[test]
-    fn a_text_delta_decodes() {
+    fn a_text_delta_carries_its_index_and_text() {
         let event: Event = serde_json::from_str(
             r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Two"}}"#,
         )
@@ -509,10 +528,13 @@ mod tests {
         }
     }
 
+    // The `text` is non-empty on purpose. The API never sends it that way, so
+    // this pins the discard rather than the wire: if prefilled content ever
+    // had to survive, this is the test that fails and says where to look.
     #[test]
     fn a_block_start_carries_its_kind_and_index() {
         let event: Event = serde_json::from_str(
-            r#"{"type":"content_block_start","index":3,"content_block":{"type":"text","text":""}}"#,
+            r#"{"type":"content_block_start","index":3,"content_block":{"type":"text","text":"PREFILL"}}"#,
         )
         .unwrap();
 
@@ -599,8 +621,11 @@ mod tests {
         }
     }
 
+    // The terminal event, and `#[serde(other)]` sits right beside it: a
+    // `MessageStop` misspelled in the enum would decode as `Unknown` instead
+    // of failing, and a reader waiting for the end would wait forever.
     #[test]
-    fn a_message_stop_decodes() {
+    fn a_message_stop_is_not_swallowed_as_unknown() {
         let event: Event = serde_json::from_str(r#"{"type":"message_stop"}"#).unwrap();
 
         match event {
@@ -609,27 +634,23 @@ mod tests {
         }
     }
 
-    // The server may add events, and `ping` is one it already sends. A decoder
-    // that rejects an unrecognized type turns every such addition into an
-    // outage.
+    // Both payloads reach `#[serde(other)]` by the same route, so they are one
+    // test. They are both here because the reasons differ: `ping` is a type
+    // the server already sends on every stream, and `some_future_event` stands
+    // for one it has not invented yet. Rejecting either turns a keep-alive, or
+    // a server-side addition, into an outage.
     #[test]
-    fn an_unknown_event_type_decodes_rather_than_failing() {
-        let event: Event =
-            serde_json::from_str(r#"{"type":"some_future_event","payload":9}"#).unwrap();
+    fn an_unrecognized_event_type_decodes_rather_than_failing() {
+        for payload in [
+            r#"{"type":"ping"}"#,
+            r#"{"type":"some_future_event","payload":9}"#,
+        ] {
+            let event: Event = serde_json::from_str(payload).unwrap();
 
-        match event {
-            Event::Unknown => {}
-            other => panic!("wrong event: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn a_ping_is_not_an_error() {
-        let event: Event = serde_json::from_str(r#"{"type":"ping"}"#).unwrap();
-
-        match event {
-            Event::Unknown => {}
-            other => panic!("wrong event: {other:?}"),
+            match event {
+                Event::Unknown => {}
+                other => panic!("{payload} decoded as {other:?}"),
+            }
         }
     }
 
@@ -649,8 +670,12 @@ mod tests {
         }
     }
 
-    // The two halves of this module meet exactly here, and nowhere else does
-    // a test show that what `data_of` hands back is what `Event` expects.
+    // Documentation of the seam rather than coverage of it: this is where a
+    // reader sees that what `data_of` hands back is what `Event` parses. The
+    // coverage is already elsewhere, because any mutation here has to change
+    // the payload string -- which
+    // `a_frame_split_across_chunks_is_reassembled` pins byte for byte, and
+    // `a_message_stop_is_not_swallowed_as_unknown` decodes.
     #[test]
     fn a_decoded_frames_payload_is_an_event() {
         let mut decoder = FrameDecoder::default();
