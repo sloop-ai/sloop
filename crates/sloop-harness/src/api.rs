@@ -8,4 +8,5 @@
 //! what lets the whole decoder be tested in a sandbox with no network and no
 //! API key -- the environment `nix build` runs the test suite in.
 
+mod accumulate;
 mod sse;
