@@ -3,7 +3,10 @@
 //! Line endings are assumed to be LF: the API sends them, and the spec's
 //! `\r\n\r\n` separator is not matched here. A CRLF stream would decode to
 //! nothing at all while the buffer grew without bound, so if that ever needs
-//! supporting it needs supporting deliberately rather than by accident.
+//! supporting it needs supporting deliberately rather than by accident. The
+//! assumption reaches one level further in as well: `data_of` splits on
+//! `str::lines`, which counts `\r\n` as one ending and strips the `\r`, so a
+//! `data:` value ending in a carriage return does not come back out intact.
 
 // Nothing outside the tests calls any of this until `Api::send` has a socket
 // to read from. `pub` exempts nothing in a binary crate, so the whole module
@@ -14,6 +17,15 @@
 
 use anyhow::{ensure, Context, Result};
 use serde::Deserialize;
+
+const SEPARATOR: &[u8] = b"\n\n";
+
+/// How much unterminated frame to tolerate before calling the stream broken.
+///
+/// A `content_block_delta` is orders of magnitude under a mebibyte, so no
+/// healthy stream approaches this and nothing is lost by refusing to buffer
+/// past it.
+const MAX_BUFFERED: usize = 1 << 20;
 
 /// Splits a byte stream into SSE frames.
 ///
@@ -34,8 +46,16 @@ impl FrameDecoder {
         // byte of a multi-byte UTF-8 sequence has its high bit set. A `\n` is
         // 0x0A, so it cannot occur inside a character, and a split on it
         // cannot land mid-character and manufacture invalid input.
+        //
+        // `separator_at` rescans from zero each time it is called, so the cost
+        // is quadratic in chunks per frame -- not in frame size, which is the
+        // reading that makes it look alarming. The `drain` is what bounds it:
+        // the buffer never holds more than one incomplete frame, and
+        // `bytes_stream()` hands over TLS-record-sized chunks, so even a 64
+        // KiB frame arrives in a handful of calls and is scanned a handful of
+        // times. Small chunks are the tripwire here, not large frames.
         let mut frames = Vec::new();
-        while let Some(end) = separator(&self.buffer) {
+        while let Some(end) = separator_at(&self.buffer) {
             let frame: Vec<u8> = self.buffer.drain(..end + SEPARATOR.len()).collect();
             frames.push(String::from_utf8(frame).context("an SSE frame was not UTF-8")?);
         }
@@ -55,27 +75,18 @@ impl FrameDecoder {
     }
 }
 
-const SEPARATOR: &[u8] = b"\n\n";
-
-/// How much unterminated frame to tolerate before calling the stream broken.
-///
-/// A `content_block_delta` is orders of magnitude under a mebibyte, so no
-/// healthy stream approaches this and nothing is lost by refusing to buffer
-/// past it.
-const MAX_BUFFERED: usize = 1 << 20;
-
-fn separator(buffer: &[u8]) -> Option<usize> {
+fn separator_at(buffer: &[u8]) -> Option<usize> {
     buffer
         .windows(SEPARATOR.len())
         .position(|pair| pair == SEPARATOR)
 }
 
-/// The payload of a frame: its `data:` lines, joined.
+/// The data of a frame: its `data:` lines, joined.
 ///
-/// The `event:` line is deliberately ignored. Every payload carries its own
-/// `type`, so reading both would give one fact two sources of truth.
+/// The `event:` line is deliberately ignored. The data carries its own `type`,
+/// so reading both would give one fact two sources of truth.
 pub fn data_of(frame: &str) -> Option<String> {
-    let mut payload: Option<String> = None;
+    let mut data: Option<String> = None;
 
     for line in frame.lines() {
         let Some(rest) = line.strip_prefix("data:") else {
@@ -83,16 +94,16 @@ pub fn data_of(frame: &str) -> Option<String> {
         };
         let rest = rest.strip_prefix(' ').unwrap_or(rest);
 
-        match &mut payload {
+        match &mut data {
             Some(joined) => {
                 joined.push('\n');
                 joined.push_str(rest);
             }
-            None => payload = Some(rest.to_owned()),
+            None => data = Some(rest.to_owned()),
         }
     }
 
-    payload
+    data
 }
 
 /// One decoded SSE event.
@@ -177,10 +188,11 @@ pub struct ApiError {
 #[expect(
     clippy::unwrap_used,
     clippy::panic,
-    reason = "inputs are literals defined in the test"
+    reason = "a test reports a failure by panicking"
 )]
 mod tests {
     use super::{data_of, BlockStart, Delta, Event, FrameDecoder, MAX_BUFFERED};
+    use proptest::prelude::*;
 
     #[test]
     fn a_frame_split_across_chunks_is_reassembled() {
@@ -213,6 +225,24 @@ mod tests {
         assert_eq!(frames.len(), 2);
         assert_eq!(data_of(&frames[0]).as_deref(), Some("one"));
         assert_eq!(data_of(&frames[1]).as_deref(), Some("two"));
+    }
+
+    // The property below subsumes this -- its chunk sizes start at one -- but
+    // a named case that fails on its own is a sharper signal than a shrunk
+    // counterexample, and byte-at-a-time is the shape most worth naming.
+    #[test]
+    fn a_stream_delivered_one_byte_at_a_time_still_frames() {
+        let mut decoder = FrameDecoder::default();
+
+        let mut frames = Vec::new();
+        for byte in b"data: one\n\ndata: two\n\ndata: three\n\n" {
+            frames.extend(decoder.decode(&[*byte]).unwrap());
+        }
+
+        assert_eq!(
+            frames,
+            vec!["data: one\n\n", "data: two\n\n", "data: three\n\n"]
+        );
     }
 
     #[test]
@@ -270,6 +300,54 @@ mod tests {
     #[test]
     fn an_empty_data_line_is_still_a_line() {
         assert_eq!(data_of("data:\ndata: x\n\n").as_deref(), Some("\nx"));
+    }
+
+    proptest! {
+        /// Chunk boundaries are the one thing this module exists to hide, so
+        /// the property is that they cannot be observed: however the same
+        /// stream is sliced, the frames that come back are the same. This is
+        /// also what covers a multi-byte character split across two chunks,
+        /// which no hand-written case is likely to place deliberately.
+        #[test]
+        fn arbitrary_chunking_yields_the_same_frames(
+            // `\r` is excluded because `str::lines` counts `\r\n` as one
+            // ending and strips the `\r`: a value ending in a carriage return
+            // does not survive `data_of`, so generating one would assert a
+            // round-trip this module deliberately does not offer.
+            payloads in prop::collection::vec("[^\r\n]{0,40}", 1..8),
+            sizes in prop::collection::vec(1usize..48, 1..16),
+        ) {
+            let mut stream = String::new();
+            for payload in &payloads {
+                stream.push_str("data: ");
+                stream.push_str(payload);
+                stream.push_str("\n\n");
+            }
+            let stream = stream.into_bytes();
+
+            let mut decoder = FrameDecoder::default();
+            let mut frames = Vec::new();
+            let mut rest = stream.as_slice();
+            let mut sizes = sizes.iter().cycle();
+            while !rest.is_empty() {
+                let take = (*sizes.next().unwrap()).min(rest.len());
+                let (chunk, tail) = rest.split_at(take);
+                frames.extend(decoder.decode(chunk).unwrap());
+                rest = tail;
+            }
+
+            // The frames themselves, not a projection of them: comparing only
+            // payloads would let a decoder that mislays a separator byte pass,
+            // because `lines` skips the blank line that mistake leaves behind.
+            let expected: Vec<String> =
+                payloads.iter().map(|p| format!("data: {p}\n\n")).collect();
+            prop_assert_eq!(&frames, &expected);
+
+            for (frame, payload) in frames.iter().zip(&payloads) {
+                let decoded = data_of(frame);
+                prop_assert_eq!(decoded.as_deref(), Some(payload.as_str()));
+            }
+        }
     }
 
     #[test]
