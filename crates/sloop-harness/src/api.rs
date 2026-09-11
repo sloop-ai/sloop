@@ -4,17 +4,27 @@
 //! the memory daemon's socket client, and this crate exists partly to show
 //! what linking the engine directly looks like instead.
 //!
-//! Everything here except `Api::send` is a pure function over bytes, which is
-//! what lets the whole decoder be tested in a sandbox with no network and no
-//! API key -- the environment `nix build` runs the test suite in.
+//! Everything here except [`Api::send`] is a pure function over bytes, which
+//! is what lets the whole decoder be tested in a sandbox with no network and
+//! no API key -- the environment `nix build` runs the test suite in.
 
 mod accumulate;
 mod sse;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
+use futures::StreamExt;
 use serde::Serialize;
 
-use crate::tree::Message;
+use crate::api::accumulate::Accumulator;
+use crate::api::sse::{data_of, FrameDecoder};
+use crate::tree::{ContentBlock, Message};
+
+const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
+
+/// Pinned rather than tracking whatever the API defaults to. The header is
+/// the only thing keeping a server-side breaking change from arriving here as
+/// a decoder bug with no commit to blame it on.
+const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 /// The model this harness talks to. Thinking is on by default here, which is
 /// why the tree has a thinking block at all.
@@ -24,10 +34,15 @@ const MODEL: &str = "claude-opus-5";
 /// non-streaming request is the HTTP timeout, and streaming removes it.
 const MAX_TOKENS: u32 = 64_000;
 
-// Dead until `Api::send` builds one. Guarded on not(test) for the reason
-// `sse.rs` spells out: under cfg(test) the tests below construct and serialize
-// it, so the label would be about a build where it does not hold.
-#[cfg_attr(not(test), expect(dead_code, reason = "no caller until Api::send"))]
+// `Api::send` builds one, and that is not enough to make it live: nothing
+// reachable from `main` calls `send` yet, and `sse.rs` spells out why an
+// unreached caller leaves its callees unreached too. Guarded on not(test) for
+// the reason given there as well -- under cfg(test) the tests below construct
+// and serialize it, so the label would be about a build where it does not hold.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "no caller until main.rs sends a turn")
+)]
 #[derive(Debug, Serialize)]
 struct Request<'a> {
     model: &'static str,
@@ -44,7 +59,10 @@ struct Request<'a> {
 /// `display: "summarized"` is the one real choice here: the default returns
 /// thinking blocks whose text is empty, which is nothing to print and nothing
 /// for the memory index to ever label.
-#[cfg_attr(not(test), expect(dead_code, reason = "no caller until Api::send"))]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "no caller until main.rs sends a turn")
+)]
 #[derive(Debug, Serialize)]
 struct Thinking {
     #[serde(rename = "type")]
@@ -52,7 +70,10 @@ struct Thinking {
     display: &'static str,
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "no caller until Api::send"))]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "no caller until main.rs sends a turn")
+)]
 impl<'a> Request<'a> {
     fn new(messages: &'a [Message]) -> Self {
         Self {
@@ -77,13 +98,28 @@ const KEY_VAR: &str = "ANTHROPIC_API_KEY";
 /// client -- a leak that is invisible at the site that causes it, because the
 /// site only asks to print a struct.
 // Unconditional rather than guarded on not(test) like `Request`, because it is
-// about two different things in the two builds and holds in both: the type is
-// never constructed without `Api::send`, and under cfg(test) the tests
-// construct it but nothing reads `http` until there is a request to send.
-#[expect(dead_code, reason = "no caller until Api::send")]
+// about two different things in the two builds and holds in both: without a
+// reachable `Api::send` the type is never constructed at all, and under
+// cfg(test) the tests do construct it but `http` has exactly one reader --
+// `send` -- so it goes unread there too.
+#[expect(dead_code, reason = "no caller until main.rs sends a turn")]
 pub struct Api {
     http: reqwest::Client,
     key: String,
+}
+
+/// One completed assistant turn.
+///
+/// `blocks` is what the tree appends and `stop_reason` is what the caller
+/// branches on -- `max_tokens` means the turn is a fragment even though every
+/// block in it is whole, which is a distinction no `Vec<ContentBlock>` can
+/// carry on its own.
+// Unconditional: no test constructs one, because constructing one means
+// running `send`, and `send` needs a socket.
+#[expect(dead_code, reason = "no reader until main.rs sends a turn")]
+pub struct Turn {
+    pub blocks: Vec<ContentBlock>,
+    pub stop_reason: Option<String>,
 }
 
 impl Api {
@@ -94,12 +130,15 @@ impl Api {
     /// the program cannot work without should fail loudly at startup.
     // Dead in both builds, not just under not(test): the test below calls
     // `from_key` precisely so that no test reads the process environment.
-    #[expect(dead_code, reason = "no caller until Api::send")]
+    #[expect(dead_code, reason = "no caller until main.rs sends a turn")]
     pub fn from_env() -> Result<Self> {
         Self::from_key(std::env::var(KEY_VAR).ok())
     }
 
-    #[cfg_attr(not(test), expect(dead_code, reason = "no caller until Api::send"))]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "no caller until main.rs sends a turn")
+    )]
     fn from_key(key: Option<String>) -> Result<Self> {
         let key = key.ok_or_else(|| {
             anyhow!(
@@ -118,6 +157,111 @@ impl Api {
             .context("could not build an HTTPS client")?;
 
         Ok(Self { http, key })
+    }
+
+    /// Send a prompt and stream the turn back.
+    ///
+    /// `messages` is whatever [`Tree::prompt_for`] returned -- the two types
+    /// meet without a conversion, which is the reason this function knows
+    /// nothing about trees, tips or status labels.
+    ///
+    /// `on_block` sees each block as it completes. Nothing here reports
+    /// partial blocks: the tree only ever accepts whole ones, so a caller that
+    /// wants a token at a time would be asking for something the tree cannot
+    /// store. Its `Result` is load-bearing rather than incidental -- a printing
+    /// failure is usually a closed pipe, and a `send` that swallowed one would
+    /// go on pulling a whole turn's tokens over the network to write them into
+    /// a reader that has gone. It doubles as the caller's only way to stop the
+    /// stream early, which is why it is not `FnMut(&ContentBlock)`.
+    ///
+    /// [`Tree::prompt_for`]: crate::tree::Tree::prompt_for
+    // The one item here with no test of its own, and the reason every label
+    // above it survives: this is where the crate stops being pure over bytes,
+    // so exercising it needs a socket and a credential, neither of which the
+    // sandbox `nix build` runs the suite in has.
+    #[expect(dead_code, reason = "no caller until main.rs sends a turn")]
+    pub async fn send(
+        &self,
+        messages: &[Message],
+        mut on_block: impl FnMut(&ContentBlock) -> Result<()>,
+    ) -> Result<Turn> {
+        let response = self
+            .http
+            .post(MESSAGES_URL)
+            .header("x-api-key", &self.key)
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .json(&Request::new(messages))
+            .send()
+            .await
+            .context("POST /v1/messages")?;
+
+        let status = response.status();
+        if !status.is_success() {
+            // The body carries the API's own error message, which is more
+            // useful than anything this side could say about a 400. Matched
+            // rather than `unwrap_or_default()`, because "the API sent no
+            // body" and "the connection broke while reading the body" are
+            // different failures with different next steps -- the first is a
+            // question for the API, the second is a question for the network
+            // -- and rendering both as an empty string picks the misleading
+            // one of the two every time the connection is at fault.
+            let body = match response.text().await {
+                Ok(body) => body,
+                Err(error) => format!("(the error body could not be read: {error})"),
+            };
+            bail!("{status} from /v1/messages: {body}");
+        }
+
+        let mut chunks = response.bytes_stream();
+        let mut frames = FrameDecoder::default();
+        let mut accumulator = Accumulator::default();
+        let mut blocks = Vec::new();
+
+        while let Some(chunk) = chunks.next().await {
+            let chunk = chunk.context("reading the response stream")?;
+
+            for frame in frames.decode(&chunk)? {
+                let Some(data) = data_of(&frame) else {
+                    continue;
+                };
+
+                // This `?` ends the turn and discards every block already in
+                // `blocks`, and that is the intended reading. `Event::Unknown`
+                // already absorbs the forward-compatible case -- an event type
+                // this slice has never heard of -- so what reaches here is a
+                // tag we do model whose body is not the shape we think it is.
+                // That is this client being wrong about the wire, not the
+                // server adding something.
+                //
+                // The alternative, skipping the frame and carrying on, returns
+                // a `Turn` that is structurally indistinguishable from a whole
+                // one: blocks with a hole in them and a `stop_reason` of
+                // `end_turn`. It gets appended to the tree and replayed into
+                // every later request, so one dropped delta becomes a
+                // permanent silent corruption of the transcript. Failing loses
+                // a turn that can be asked for again; tolerating it loses the
+                // ability to tell which turns are real.
+                let event = serde_json::from_str(&data)
+                    .with_context(|| format!("decoding an SSE event: {data}"))?;
+
+                if let Some(block) = accumulator.apply(event)? {
+                    on_block(&block).context("reporting a completed block")?;
+                    blocks.push(block);
+                }
+            }
+        }
+
+        // A stream that ends without its `message_delta` leaves this `None`,
+        // and that is the one truncation the decision above does not catch: a
+        // body cut at a frame boundary reaches here as a clean end of stream
+        // rather than an error. `Option` is what carries it -- `None` means
+        // the turn never said why it stopped, which is the caller's cue that
+        // it may be a fragment. A `stop_reason` defaulted to `end_turn` here
+        // would erase exactly that.
+        Ok(Turn {
+            blocks,
+            stop_reason: accumulator.stop_reason().map(str::to_owned),
+        })
     }
 }
 

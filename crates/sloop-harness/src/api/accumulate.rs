@@ -5,10 +5,13 @@
 //! lives, so `send` stays a loop that hands events over and forwards whatever
 //! comes back.
 
-// Only the tests drive this until `Api::send` has a socket to read from; the
-// attribute and this note go with that commit. Guarded on not(test) for the
-// same reason as `sse.rs`: under cfg(test) every item here is reached, so an
-// unconditional expectation would be about a build where it does not hold.
+// `Api::send` drives this now, and the label still has to stay: `send` itself
+// is not reachable from `main` until the binary sends a turn, and dead-code
+// analysis reaches callees through live callers only. `sse.rs` spells out both
+// that and the reason for the not(test) guard, which is the same here --
+// under cfg(test) every item is reached, so an unconditional expectation would
+// be about a build where it does not hold, and would hide a dead helper in the
+// one build that can still see one.
 #![cfg_attr(not(test), expect(dead_code, reason = "see above"))]
 
 use std::collections::BTreeMap;
