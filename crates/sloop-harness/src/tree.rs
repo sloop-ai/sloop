@@ -31,19 +31,43 @@ pub enum Role {
 
 /// One content block, serialized in the shape `/v1/messages` expects.
 ///
-/// Text is the only kind today. `thinking`, `tool_use` and `tool_result`
-/// arrive with the HTTP slice; the internally tagged representation means
-/// adding them is not a breaking change to a stored tree.
+/// `tool_use` and `tool_result` are still absent; they arrive with the slice
+/// that has tools to call. `thinking` is here because there is no request
+/// shape that avoids it: thinking is on by default on the model this crate
+/// talks to, so a response contains one whether or not the caller asked.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
-    Text { text: String },
+    Text {
+        text: String,
+    },
+    /// The `signature` binds the conversation prefix that produced this block.
+    /// It travels back unchanged or the turn after it is rejected, which is
+    /// why nothing here reformats or normalizes it.
+    Thinking {
+        thinking: String,
+        signature: String,
+    },
 }
 
 impl ContentBlock {
     /// A text block.
     pub fn text(text: impl Into<String>) -> Self {
         Self::Text { text: text.into() }
+    }
+
+    /// A thinking block, with the signature that authenticates it.
+    // Only the tests construct one so far: the binary writes its own
+    // transcript by hand, and a thinking block is something a *response*
+    // carries. Hence not(test) -- under cfg(test) the constructor is live and
+    // an expectation that held there would itself go unfulfilled. Attribute
+    // and comment both go once a response is parsed into one of these.
+    #[cfg_attr(not(test), expect(dead_code, reason = "see above"))]
+    pub fn thinking(thinking: impl Into<String>, signature: impl Into<String>) -> Self {
+        Self::Thinking {
+            thinking: thinking.into(),
+            signature: signature.into(),
+        }
     }
 }
 
@@ -293,11 +317,23 @@ mod tests {
         out
     }
 
-    fn texts(messages: &[Message]) -> Vec<String> {
+    /// The prose of every block, whichever kind it is.
+    ///
+    /// Thinking counts as prose here: the tests that read this one compare
+    /// against string literals, so what they are checking is which blocks
+    /// landed on a branch, not what kind they are. Anything that turns on a
+    /// signature has to compare the blocks themselves.
+    fn prose(messages: &[Message]) -> Vec<String> {
         let mut out = Vec::new();
         for message in messages {
             for block in &message.content {
-                let ContentBlock::Text { text } = block;
+                let text = match block {
+                    ContentBlock::Text { text } => text,
+                    ContentBlock::Thinking {
+                        thinking,
+                        signature: _,
+                    } => thinking,
+                };
                 out.push(text.clone());
             }
         }
@@ -328,7 +364,7 @@ mod tests {
         // They share the prefix and differ only in the forked block.
         assert_eq!(kept[0], abandoned[0]);
         assert_eq!(
-            texts(&kept),
+            prose(&kept),
             vec![
                 "How should the cache expire?",
                 "Two options.",
@@ -336,7 +372,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            texts(&abandoned),
+            prose(&abandoned),
             vec![
                 "How should the cache expire?",
                 "Two options.",
@@ -358,7 +394,7 @@ mod tests {
 
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, Role::User);
-        assert_eq!(texts(&messages), vec!["hello"]);
+        assert_eq!(prose(&messages), vec!["hello"]);
     }
 
     #[test]
@@ -421,6 +457,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_thinking_block_round_trips_byte_identically() {
+        // The signature binds the conversation prefix that produced the block.
+        // A representation that does not survive a round trip is rejected on the
+        // next turn, so this is the guarantee, not a serialization detail.
+        let wire = r#"{"type":"thinking","thinking":"Weighing LRU against TTL.","signature":"ErUBCkYIBRgCIkA="}"#;
+
+        let block: ContentBlock = serde_json::from_str(wire).unwrap();
+        assert_eq!(serde_json::to_string(&block).unwrap(), wire);
+    }
+
+    #[test]
+    fn a_turn_may_open_with_thinking_and_continue_in_text() {
+        let mut tree = Tree::new(ContentBlock::text("How should the cache expire?"));
+        let thinking = tree
+            .append(
+                tree.root(),
+                Role::Assistant,
+                ContentBlock::thinking("Weighing LRU against TTL.", "ErUBCkYIBRgCIkA="),
+            )
+            .unwrap();
+        let text = tree
+            .append(
+                thinking,
+                Role::Assistant,
+                ContentBlock::text("Two options."),
+            )
+            .unwrap();
+
+        // One assistant turn, two blocks: the grouping rule does not care which
+        // kinds they are. Asserting the blocks themselves rather than a count
+        // is what pins the order -- thinking leads, and the signature it came
+        // with is still attached to it.
+        let messages = tree.replay(text).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            messages[1].content,
+            vec![
+                ContentBlock::thinking("Weighing LRU against TTL.", "ErUBCkYIBRgCIkA="),
+                ContentBlock::text("Two options."),
+            ]
+        );
+    }
+
     // ---- prompt_for ----------------------------------------------------
 
     #[test]
@@ -430,7 +510,7 @@ mod tests {
         // The whole assistant turn regenerates, so neither of its blocks is sent.
         assert_eq!(roles(&tree.prompt_for(a2).unwrap()), vec![Role::User]);
         assert_eq!(
-            texts(&tree.prompt_for(a2).unwrap()),
+            prose(&tree.prompt_for(a2).unwrap()),
             vec!["How should the cache expire?"]
         );
     }
@@ -523,21 +603,37 @@ mod tests {
 
     // ---- properties ----------------------------------------------------
 
-    /// Build a tree from a script of `(parent selector, is assistant)` steps.
+    /// Build a tree from a script of `(parent selector, is assistant,
+    /// is thinking)` steps.
     ///
     /// Selecting the parent modulo the node count puts forks wherever the
     /// generator likes, which is the axis these properties have to hold on.
-    fn build(script: &[(usize, bool)]) -> Tree {
+    /// The kind is the second axis: replay groups by role alone, so mixing
+    /// thinking into a turn must not change where any boundary falls.
+    ///
+    /// Content is derived from the index rather than generated. No property
+    /// asserts a particular value, but it must be distinct per node so
+    /// [`replay_preserves_every_block_on_the_path`] can compare sequences
+    /// instead of lengths, and so a shrunk counterexample stays readable.
+    fn build(script: &[(usize, bool, bool)]) -> Tree {
         let mut tree = Tree::new(ContentBlock::text("root"));
         let mut ids = vec![tree.root()];
-        for (index, (selector, is_assistant)) in script.iter().enumerate() {
+        for (index, (selector, is_assistant, is_thinking)) in script.iter().enumerate() {
             let parent = ids[selector % ids.len()];
             let role = if *is_assistant {
                 Role::Assistant
             } else {
                 Role::User
             };
-            let block = ContentBlock::text(format!("block {index}"));
+            // Gated on the role: only a model produces thinking, so a user
+            // thinking block is a transcript the API would reject. Nothing
+            // here would catch it, which is exactly why it must not be
+            // generated -- the next reader would take it for a legal shape.
+            let block = if *is_assistant && *is_thinking {
+                ContentBlock::thinking(format!("block {index}"), format!("signature {index}"))
+            } else {
+                ContentBlock::text(format!("block {index}"))
+            };
             if let Some(id) = tree.append(parent, role, block) {
                 ids.push(id);
             }
@@ -545,8 +641,8 @@ mod tests {
         tree
     }
 
-    fn script() -> impl Strategy<Value = Vec<(usize, bool)>> {
-        proptest::collection::vec((0_usize..64, any::<bool>()), 0..40)
+    fn script() -> impl Strategy<Value = Vec<(usize, bool, bool)>> {
+        proptest::collection::vec((0_usize..64, any::<bool>(), any::<bool>()), 0..40)
     }
 
     fn alternates(messages: &[Message]) -> bool {
@@ -601,12 +697,20 @@ mod tests {
             for leaf in leaves {
                 let path = tree.path(leaf).unwrap();
                 let messages = tree.replay(leaf).unwrap();
-                let mut blocks = 0;
-                for message in &messages {
-                    blocks += message.content.len();
+
+                // The blocks themselves, not a projection of them. Lengths
+                // alone would miss a transposition, and prose alone would miss
+                // a mangled signature -- which is a 400 on the next turn, so
+                // it has to fail here.
+                let mut walked = Vec::new();
+                for id in &path {
+                    walked.push(tree.node(*id).unwrap().block.clone());
                 }
-                prop_assert_eq!(blocks, path.len());
-                prop_assert_eq!(texts(&messages).len(), path.len());
+                let mut emitted = Vec::new();
+                for message in &messages {
+                    emitted.extend(message.content.iter().cloned());
+                }
+                prop_assert_eq!(emitted, walked);
             }
         }
 
