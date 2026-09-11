@@ -13,6 +13,7 @@ mod sse;
 
 use anyhow::{anyhow, bail, Context, Result};
 use futures::StreamExt;
+use reqwest::header::HeaderValue;
 use serde::Serialize;
 
 use crate::api::accumulate::Accumulator;
@@ -159,6 +160,42 @@ impl Api {
         Ok(Self { http, key })
     }
 
+    /// The credential, as a header value that will not print itself.
+    ///
+    /// `Api` not deriving `Debug` is only half of keeping the key out of a
+    /// log, and this is the other half. reqwest's `HeaderMap` and `Request`
+    /// print header *values* in their own `Debug`, so anything that formats a
+    /// request -- an error path, a retry log, a `tracing` span added later --
+    /// would print the key in full and the absent derive would have bought
+    /// nothing. `set_sensitive` makes it render as `Sensitive` instead.
+    /// `anthropic-version` is deliberately left as a plain `&str` at the call
+    /// site: it is a pinned constant rather than a secret, and the asymmetry
+    /// is the point rather than an omission.
+    ///
+    /// A method rather than four lines inside `send` because `send` is the one
+    /// thing here that cannot be tested without a socket, and this is the one
+    /// thing in `send` that can. The tests below are what keep it from reading
+    /// as ceremony and being deleted as such.
+    // Live under cfg(test) through those tests; `send` is its only other
+    // caller and is itself unreached until main.rs sends a turn.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "no caller until main.rs sends a turn")
+    )]
+    fn key_header(&self) -> Result<HeaderValue> {
+        // `from_str` rejects anything outside visible ASCII, which moves one
+        // failure earlier: a key carrying a trailing newline or a copy-paste
+        // space fails here, naming the problem, rather than arriving as an
+        // unexplained 401 from the far end.
+        let mut key = HeaderValue::from_str(&self.key).context(
+            "the API key is not usable as a header value: \
+             it must be visible ASCII with no surrounding whitespace",
+        )?;
+        key.set_sensitive(true);
+
+        Ok(key)
+    }
+
     /// Send a prompt and stream the turn back.
     ///
     /// `messages` is whatever [`Tree::prompt_for`] returned -- the two types
@@ -188,7 +225,7 @@ impl Api {
         let response = self
             .http
             .post(MESSAGES_URL)
-            .header("x-api-key", &self.key)
+            .header("x-api-key", self.key_header()?)
             .header("anthropic-version", ANTHROPIC_VERSION)
             .json(&Request::new(messages))
             .send()
@@ -287,13 +324,20 @@ mod tests {
         };
         let message = error.to_string();
 
-        // Two claims rather than one, because the message has two jobs and
-        // only the first survives a careless reword. Naming the variable is
-        // what makes the failure diagnosable; the command is what makes it
-        // fixable without a trip to the source. Substrings rather than the
-        // whole message on purpose -- the prose around them is meant to be
-        // rewritten, and a test that pinned it would only ever be repasted.
-        assert!(message.contains("ANTHROPIC_API_KEY"), "{message}");
+        // Two claims rather than one, because the message has two jobs.
+        // Naming the variable is what makes the failure diagnosable; the
+        // command is what makes it fixable without a trip to the source.
+        //
+        // The first is anchored to the start rather than merely present.
+        // `contains` passed against a message that had lost its opening
+        // mention and read " is not set." -- naming nothing at the one point
+        // a reader looks first, while the later `export` line kept the
+        // substring alive. One sentence is pinned, not the prose around it,
+        // which is still meant to be rewritable.
+        assert!(
+            message.starts_with("ANTHROPIC_API_KEY is not set"),
+            "{message}"
+        );
         assert!(message.contains("export ANTHROPIC_API_KEY="), "{message}");
     }
 
@@ -306,6 +350,36 @@ mod tests {
         };
 
         assert_eq!(api.key, "sk-ant-test");
+    }
+
+    // The half of the credential's protection that `Api` not deriving `Debug`
+    // does not cover. This asserts the property -- the key does not appear --
+    // rather than the literal `Sensitive` that http happens to print today,
+    // because it is the property that matters and the spelling that may move.
+    #[test]
+    fn the_api_key_header_does_not_print_its_value() {
+        let Ok(api) = Api::from_key(Some("sk-ant-secret".to_owned())) else {
+            panic!("a key that was present was rejected");
+        };
+        let header = api.key_header().unwrap();
+
+        assert!(!format!("{header:?}").contains("sk-ant-secret"));
+    }
+
+    // A key is pasted by a person, so the newline comes along often enough to
+    // be worth a named error. Without this the same input reaches the API and
+    // comes back as a 401, which points at the key being wrong rather than at
+    // it being punctuated wrong.
+    #[test]
+    fn a_key_with_a_stray_newline_is_refused_before_the_request() {
+        let Ok(api) = Api::from_key(Some("sk-ant-secret\n".to_owned())) else {
+            panic!("a key that was present was rejected");
+        };
+        let Err(error) = api.key_header() else {
+            panic!("a key with a trailing newline was accepted as a header");
+        };
+
+        assert!(error.to_string().contains("header value"), "{error}");
     }
 
     #[test]
