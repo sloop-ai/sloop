@@ -8,24 +8,6 @@
 //! `str::lines`, which counts `\r\n` as one ending and strips the `\r`, so a
 //! `data:` value ending in a carriage return does not come back out intact.
 
-// `Api::send` reads all of this now, and the label still has to stay, which is
-// worth a word because the obvious reading says otherwise. Dead-code analysis
-// in a binary crate is reachability from `main`, not "has a caller somewhere":
-// `send` has no caller of its own until the binary sends a turn, so an
-// unreached caller leaves its whole callee tree unreached too. The label goes
-// when that chain reaches the root, not when the first link of it is written.
-// `pub` exempts nothing here either -- a binary crate has no downstream.
-//
-// The not(test) guard is what keeps a module-wide label from being a blind
-// spot. Under cfg(test) the tests reach every item, so nothing here is dead in
-// that build and the attribute does not apply to it; a genuinely dead helper
-// added to this module is still reported, by the test build that
-// `--all-targets` compiles. Checked by adding one. That matters because rustc
-// does not report an unfulfilled `dead_code` expectation, so this attribute
-// will never announce its own obsolescence -- the cfg(test) build is the only
-// thing here that will.
-#![cfg_attr(not(test), expect(dead_code, reason = "see above"))]
-
 use anyhow::{ensure, Context, Result};
 use serde::Deserialize;
 

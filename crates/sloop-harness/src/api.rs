@@ -35,15 +35,10 @@ const MODEL: &str = "claude-opus-5";
 /// non-streaming request is the HTTP timeout, and streaming removes it.
 const MAX_TOKENS: u32 = 64_000;
 
-// `Api::send` builds one, and that is not enough to make it live: nothing
-// reachable from `main` calls `send` yet, and `sse.rs` spells out why an
-// unreached caller leaves its callees unreached too. Guarded on not(test) for
-// the reason given there as well -- under cfg(test) the tests below construct
-// and serialize it, so the label would be about a build where it does not hold.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "no caller until main.rs sends a turn")
-)]
+/// The body of a `/v1/messages` request.
+///
+/// `output_config` is absent: its only field this harness would set is
+/// `effort`, whose default is already the value we would name.
 #[derive(Debug, Serialize)]
 struct Request<'a> {
     model: &'static str,
@@ -55,15 +50,11 @@ struct Request<'a> {
     messages: &'a [Message],
 }
 
-/// `budget_tokens` is absent because it is a 400 on this model, and
-/// `output_config.effort` because its default is the value we would set.
+/// `budget_tokens` is absent because it is a 400 on this model.
+///
 /// `display: "summarized"` is the one real choice here: the default returns
 /// thinking blocks whose text is empty, which is nothing to print and nothing
 /// for the memory index to ever label.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "no caller until main.rs sends a turn")
-)]
 #[derive(Debug, Serialize)]
 struct Thinking {
     #[serde(rename = "type")]
@@ -71,10 +62,6 @@ struct Thinking {
     display: &'static str,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "no caller until main.rs sends a turn")
-)]
 impl<'a> Request<'a> {
     fn new(messages: &'a [Message]) -> Self {
         Self {
@@ -98,12 +85,6 @@ const KEY_VAR: &str = "ANTHROPIC_API_KEY";
 /// and a derived `Debug` would put it into any error or trace that formats the
 /// client -- a leak that is invisible at the site that causes it, because the
 /// site only asks to print a struct.
-// Unconditional rather than guarded on not(test) like `Request`, because it is
-// about two different things in the two builds and holds in both: without a
-// reachable `Api::send` the type is never constructed at all, and under
-// cfg(test) the tests do construct it but `http` has exactly one reader --
-// `send` -- so it goes unread there too.
-#[expect(dead_code, reason = "no caller until main.rs sends a turn")]
 pub struct Api {
     http: reqwest::Client,
     key: String,
@@ -115,9 +96,6 @@ pub struct Api {
 /// branches on -- `max_tokens` means the turn is a fragment even though every
 /// block in it is whole, which is a distinction no `Vec<ContentBlock>` can
 /// carry on its own.
-// Unconditional: no test constructs one, because constructing one means
-// running `send`, and `send` needs a socket.
-#[expect(dead_code, reason = "no reader until main.rs sends a turn")]
 pub struct Turn {
     pub blocks: Vec<ContentBlock>,
     pub stop_reason: Option<String>,
@@ -129,17 +107,10 @@ impl Api {
     /// This is the only credential source. A missing key fails here rather
     /// than at the first request, following `SLOOP_MEMORY_MODEL`: an input
     /// the program cannot work without should fail loudly at startup.
-    // Dead in both builds, not just under not(test): the test below calls
-    // `from_key` precisely so that no test reads the process environment.
-    #[expect(dead_code, reason = "no caller until main.rs sends a turn")]
     pub fn from_env() -> Result<Self> {
         Self::from_key(std::env::var(KEY_VAR).ok())
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "no caller until main.rs sends a turn")
-    )]
     fn from_key(key: Option<String>) -> Result<Self> {
         let key = key.ok_or_else(|| {
             anyhow!(
@@ -176,12 +147,6 @@ impl Api {
     /// thing here that cannot be tested without a socket, and this is the one
     /// thing in `send` that can. The tests below are what keep it from reading
     /// as ceremony and being deleted as such.
-    // Live under cfg(test) through those tests; `send` is its only other
-    // caller and is itself unreached until main.rs sends a turn.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "no caller until main.rs sends a turn")
-    )]
     fn key_header(&self) -> Result<HeaderValue> {
         // `from_str` rejects anything outside visible ASCII, which moves one
         // failure earlier: a key carrying a trailing newline or a copy-paste
@@ -212,11 +177,10 @@ impl Api {
     /// stream early, which is why it is not `FnMut(&ContentBlock)`.
     ///
     /// [`Tree::prompt_for`]: crate::tree::Tree::prompt_for
-    // The one item here with no test of its own, and the reason every label
-    // above it survives: this is where the crate stops being pure over bytes,
-    // so exercising it needs a socket and a credential, neither of which the
-    // sandbox `nix build` runs the suite in has.
-    #[expect(dead_code, reason = "no caller until main.rs sends a turn")]
+    // The one item here with no test of its own: this is where the crate
+    // stops being pure over bytes, so exercising it needs a socket and a
+    // credential, neither of which the sandbox `nix build` runs the suite in
+    // has.
     pub async fn send(
         &self,
         messages: &[Message],

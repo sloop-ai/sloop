@@ -57,11 +57,14 @@ impl ContentBlock {
     }
 
     /// A thinking block, with the signature that authenticates it.
-    // Only the tests construct one so far: the binary writes its own
-    // transcript by hand, and a thinking block is something a *response*
-    // carries. Hence not(test) -- under cfg(test) the constructor is live and
-    // an expectation that held there would itself go unfulfilled. Attribute
-    // and comment both go once a response is parsed into one of these.
+    // Only the tests construct one *through this*. Responses are parsed into
+    // the variant now, but `api::accumulate` builds it as a struct literal:
+    // it already holds the two strings separately and has nothing to convert,
+    // so routing through a constructor taking `impl Into<String>` would buy
+    // it nothing. That leaves this a test convenience, and the attribute
+    // stays until some caller needs the conversion. Hence not(test) -- under
+    // cfg(test) the constructor is live and an expectation that held there
+    // would itself go unfulfilled.
     #[cfg_attr(not(test), expect(dead_code, reason = "see above"))]
     pub fn thinking(thinking: impl Into<String>, signature: impl Into<String>) -> Self {
         Self::Thinking {
