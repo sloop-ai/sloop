@@ -95,19 +95,33 @@ why the error message for a missing model names the wrapped binary: a raw
 
 ## What this does not cover
 
-`sloop-harness` now holds a conversation tree: nodes are content blocks,
-carry a kept / abandoned / pending label, and replay to a `messages[]` array.
-Its README covers the model. What is still unbuilt there is everything that
-touches the outside world -- the HTTP client for `/v1/messages`, and with it
-API keys and cost -- plus block kinds beyond text, cache-hit instrumentation,
-and indexing a transcript back into `sloop-memory`.
+`sloop-harness` now holds a conversation tree and a client that fills it.
+Nodes are content blocks carrying a kept / abandoned / pending label, a branch
+replays to a `messages[]` array, and `api` streams a turn back from
+`/v1/messages` as blocks the tree appends. Its README covers both. Still
+unbuilt: `tool_use` and `tool_result` and the fork-validity rule they need,
+retries, cache-hit instrumentation, and indexing a transcript back into
+`sloop-memory`.
 
-Two constraints shape that crate and are worth repeating here, because both
-are external facts rather than choices. There is no official Anthropic SDK for
-Rust, so the client will talk raw HTTP. And assistant prefill was removed from
+The client has its own internal seam, and it exists for the same reason the
+library/binary split does. Everything except the single socket call is a pure
+function over bytes -- framing, event decoding, block accumulation -- so the
+whole decoder is exercised by `cargo test` in the nix sandbox, which has no
+network and no API key. Only `Api::send` cannot be tested that way, and it is
+deliberately thin enough that the demo binary is what proves it.
+
+Three constraints shape that crate and are worth repeating here, because all
+three are external facts rather than choices. There is no official Anthropic
+SDK for Rust, so the client talks raw HTTP. Assistant prefill was removed from
 current models, which is why the tree's nodes have to be content blocks rather
 than whole messages: a branch cannot resume a truncated turn, so it must be
-able to name the block boundary it regenerates from.
+able to name the block boundary it regenerates from. And thinking is on by
+default on the model the harness targets, so a response carries `thinking`
+blocks whether or not the caller asked -- which is why `ContentBlock` has that
+variant while `tool_use` can wait. A thinking block's signature binds the
+conversation prefix that produced it and has to travel back byte-identical,
+which the tree gets for free: it only ever appends, and a fork truncates the
+tail rather than rewriting history.
 
 The harness still reaches only for `config` and `index`. The tree itself needs
 nothing from the engine at all, which is the expected shape -- the link exists

@@ -45,7 +45,9 @@ the prefill constraint made executable -- an assistant turn cannot be
 continued, so it is regenerated from the last user boundary. Because the root
 is a user block, its result always starts and ends with a user message.
 
-## Two constraints on the design
+## Three constraints on the design
+
+All three are facts about the API rather than choices made here.
 
 There is no official Anthropic SDK for Rust. Python, TypeScript, Java, Go, Ruby,
 C# and PHP have one; Rust does not. This talks raw HTTP to `/v1/messages`.
@@ -54,6 +56,20 @@ Assistant prefill was removed from current models -- supplying a partial final
 assistant turn returns HTTP 400. So a branch cannot continue a truncated turn.
 It regenerates the turn from a content-block boundary instead, which is why the
 tree's nodes are content blocks rather than whole messages.
+
+Thinking is on by default on the model this targets. Omitting the `thinking`
+parameter runs adaptive thinking rather than disabling it, so the first real
+response contains `thinking` blocks whether or not the caller asked. That is
+why `ContentBlock` has that variant while `tool_use` waits for a slice with
+tools in it -- there is no request shape that avoids one.
+
+The consequence worth knowing is about the signature rather than the text. A
+thinking block's `signature` binds the conversation prefix that produced it,
+and editing an earlier turn invalidates every later one, so it has to travel
+back byte-identical. This tree satisfies that by construction rather than by
+care: forking truncates the tail and steering appends, so every transcript it
+produces is append-only over whatever prefix remains. A harness that rewrote
+history to retry a turn would not have that for free.
 
 ## Steering and forking are the same primitive
 
@@ -67,10 +83,40 @@ The tree needs no second operation for this. Steering is
 off an interior assistant block. `prompt_for` then leaves the branch alone,
 because it already ends on a user message.
 
+## The client
+
+`api` talks raw HTTP to `/v1/messages` and streams a turn back as blocks the
+tree appends. It is three layers, and every one of them except the socket call
+is a pure function over bytes:
+
+    api::sse::FrameDecoder   a chunked byte stream -> SSE frames
+    api::sse::Event          a frame's payload -> a typed event
+    api::accumulate          a stream of events -> completed ContentBlocks
+    api::Api::send           the only function that touches a socket
+
+That split is the reason the decoder is testable at all. `nix build` runs the
+workspace's tests in a sandbox with no network and no API key, so anything
+reaching for a socket could not be covered there. Recorded `.sse` fixtures
+stand in for the wire, and they double as the only readable record of the
+format in the repo.
+
+A block reaches the tree at `content_block_stop`, never part-written. The tree
+keeps its single growth operation and stays append-only, which is also the
+shape a thinking block's signature requires of a history.
+
+`ANTHROPIC_API_KEY` is the only credential source, and a missing one fails
+before any request is built.
+
+    cargo run -p sloop-harness -- "How should the cache expire?"
+
+sends the opening turn, forks at a block boundary, regenerates the forked turn,
+labels one branch kept and the other abandoned, and prints both as `messages[]`
+arrays.
+
 ## Not built yet
 
-- the HTTP client for `/v1/messages`, and with it API keys and cost
-- block kinds beyond text: `thinking`, `tool_use`, `tool_result`
+- `tool_use` and `tool_result`, and the fork-validity rule they need
+- retries and backoff
 - cache-hit instrumentation
 - indexing a transcript into `sloop-memory`
 
