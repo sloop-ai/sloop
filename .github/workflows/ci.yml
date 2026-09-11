@@ -60,8 +60,14 @@ jobs:
 
   # cargoHash pins the vendored crate set. A Cargo.lock change invalidates it,
   # and the `package` job below only runs on push -- so without this a stale
-  # hash would land on main before anything noticed. Building just the vendor
-  # derivation checks the hash without compiling anything.
+  # hash would land on main before anything noticed.
+  #
+  # Building the vendor derivation is not on its own that check, which is what
+  # this job used to do. `cargoDeps` is a fixed-output derivation: it validates
+  # that the vendor tree hashes to what cargoHash records, and says nothing
+  # about the repository. It exits 0 while the package build is broken, and it
+  # did -- a stale hash survived three commits and two reviews here because
+  # every check anyone ran was this one.
   vendor:
     name: cargo vendor hash
     runs-on: ubuntu-latest
@@ -72,8 +78,18 @@ jobs:
 
       - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
 
+      # fetchCargoVendor copies Cargo.lock into the vendor output, and
+      # cargoSetupPostPatchHook compares that copy against the repository's
+      # before the package compiles. Running the comparison here is the same
+      # check, minus the wait for the whole lance tree to build first. Any edit
+      # to the lock invalidates the hash, including one that adds no
+      # `[[package]]` entry -- a workspace member gaining a dependency on an
+      # already-vendored crate is enough.
       - name: verify cargoHash
-        run: nix build .#sloop-memory.cargoDeps --no-link
+        run: |
+          set -euo pipefail
+          vendor=$(nix build .#sloop-memory.cargoDeps --no-link --print-out-paths)
+          diff -u Cargo.lock "$vendor/Cargo.lock"
 
   deny:
     name: cargo-deny
