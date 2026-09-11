@@ -77,8 +77,20 @@
             # nixpkgs' importCargoLock fetches crates from crates.io's /api/v1
             # endpoint, which crates.io rate-limits. Cargo's own vendoring uses
             # the sparse registry plus the static.crates.io CDN, which is not.
-            # Update this hash whenever Cargo.lock changes.
-            cargoHash = "sha256-xyGTP/jjD6u5546bfpGe+GEhyi0S6437BEM5z8NDAe8=";
+            # Update this hash whenever Cargo.lock changes -- *any* change,
+            # including one that adds no new crate. Twice now the reasoning
+            # "these crates were already vendored by the lance tree, so the
+            # vendor directory is unchanged, so the hash still holds" has
+            # looked sound and been wrong: fetchCargoVendor copies Cargo.lock
+            # itself into the vendor output, and cargoSetupPostPatchHook
+            # compares that copy against the source tree's. Editing a
+            # [[package]] entry's dependency list is enough to fail it.
+            #
+            # `nix build .#sloop-memory.cargoDeps` is NOT the check for this.
+            # It validates the vendor derivation's own output hash and passes
+            # while the package build is broken. Only the full package build
+            # runs the hook that compares the two lock files.
+            cargoHash = "sha256-8OGCtxPeiJrQIq7JBycrlp8lmPxFRd/HsqK4lWkrOkQ=";
             cargoBuildFlags = [ "-p" "sloop-memory" ];
 
             # protoc is build-time codegen for lance-encoding's .proto files,
