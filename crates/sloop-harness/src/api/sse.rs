@@ -302,6 +302,85 @@ mod tests {
         assert_eq!(data_of("data:\ndata: x\n\n").as_deref(), Some("\nx"));
     }
 
+    /// One line of a generated frame, in the shapes a real stream mixes.
+    /// Every rendering is non-empty, so no frame can contain the separator
+    /// and the frame count is always exactly the payload count.
+    #[derive(Debug, Clone)]
+    enum Line {
+        Comment(String),
+        Event(String),
+        Data(String),
+    }
+
+    impl Line {
+        fn data(&self) -> Option<&str> {
+            match self {
+                Self::Data(payload) => Some(payload),
+                Self::Comment(_) | Self::Event(_) => None,
+            }
+        }
+
+        fn render(&self) -> String {
+            match self {
+                Self::Comment(text) => format!(": {text}"),
+                Self::Event(name) => format!("event: {name}"),
+                Self::Data(payload) => format!("data: {payload}"),
+            }
+        }
+    }
+
+    // `\r` is excluded deliberately, not for tidiness: `str::lines` treats
+    // `\r\n` as one ending and eats the `\r`, so a payload ending in one
+    // cannot round-trip. That is a second consequence of assuming LF.
+    fn line() -> impl Strategy<Value = Line> {
+        prop_oneof![
+            "[^\r\n]{0,20}".prop_map(Line::Comment),
+            "[a-z_]{1,16}".prop_map(Line::Event),
+            "[^\r\n]{0,40}".prop_map(Line::Data),
+        ]
+    }
+
+    /// How the stream reaches the decoder. The degenerate splits are named
+    /// rather than left to chance: byte-at-a-time is the harshest case a
+    /// real stream can produce, and a single chunk is the case where the
+    /// buffer never has to bridge anything. Random sizes alone would sample
+    /// both too rarely to count as covered.
+    #[derive(Debug, Clone)]
+    enum Split {
+        EveryByte,
+        Whole,
+        Sizes(Vec<usize>),
+    }
+
+    impl Split {
+        fn chunks<'a>(&self, stream: &'a [u8]) -> Vec<&'a [u8]> {
+            match self {
+                Self::EveryByte => stream.chunks(1).collect(),
+                Self::Whole => vec![stream],
+                Self::Sizes(sizes) => {
+                    let mut chunks = Vec::new();
+                    let mut rest = stream;
+                    let mut sizes = sizes.iter().cycle();
+                    while !rest.is_empty() {
+                        let take = (*sizes.next().unwrap()).min(rest.len());
+                        let (chunk, tail) = rest.split_at(take);
+                        chunks.push(chunk);
+                        rest = tail;
+                    }
+                    chunks
+                }
+            }
+        }
+    }
+
+    fn split() -> impl Strategy<Value = Split> {
+        prop_oneof![
+            1 => Just(Split::EveryByte),
+            1 => Just(Split::Whole),
+            4 => prop::collection::vec(1usize..48, 1..16).prop_map(Split::Sizes),
+        ]
+    }
+
     proptest! {
         /// Chunk boundaries are the one thing this module exists to hide, so
         /// the property is that they cannot be observed: however the same
@@ -310,42 +389,46 @@ mod tests {
         /// which no hand-written case is likely to place deliberately.
         #[test]
         fn arbitrary_chunking_yields_the_same_frames(
-            // `\r` is excluded because `str::lines` counts `\r\n` as one
-            // ending and strips the `\r`: a value ending in a carriage return
-            // does not survive `data_of`, so generating one would assert a
-            // round-trip this module deliberately does not offer.
-            payloads in prop::collection::vec("[^\r\n]{0,40}", 1..8),
-            sizes in prop::collection::vec(1usize..48, 1..16),
+            frames in prop::collection::vec(prop::collection::vec(line(), 1..5), 1..8),
+            split in split(),
         ) {
-            let mut stream = String::new();
-            for payload in &payloads {
-                stream.push_str("data: ");
-                stream.push_str(payload);
-                stream.push_str("\n\n");
-            }
-            let stream = stream.into_bytes();
+            let rendered: Vec<String> = frames
+                .iter()
+                .map(|lines| {
+                    let mut frame = String::new();
+                    for line in lines {
+                        frame.push_str(&line.render());
+                        frame.push('\n');
+                    }
+                    frame.push('\n');
+                    frame
+                })
+                .collect();
+            let stream = rendered.concat().into_bytes();
 
             let mut decoder = FrameDecoder::default();
-            let mut frames = Vec::new();
-            let mut rest = stream.as_slice();
-            let mut sizes = sizes.iter().cycle();
-            while !rest.is_empty() {
-                let take = (*sizes.next().unwrap()).min(rest.len());
-                let (chunk, tail) = rest.split_at(take);
-                frames.extend(decoder.decode(chunk).unwrap());
-                rest = tail;
+            let mut decoded = Vec::new();
+            for chunk in split.chunks(&stream) {
+                decoded.extend(decoder.decode(chunk).unwrap());
             }
 
             // The frames themselves, not a projection of them: comparing only
             // payloads would let a decoder that mislays a separator byte pass,
             // because `lines` skips the blank line that mistake leaves behind.
-            let expected: Vec<String> =
-                payloads.iter().map(|p| format!("data: {p}\n\n")).collect();
-            prop_assert_eq!(&frames, &expected);
+            prop_assert_eq!(&decoded, &rendered);
 
-            for (frame, payload) in frames.iter().zip(&payloads) {
-                let decoded = data_of(frame);
-                prop_assert_eq!(decoded.as_deref(), Some(payload.as_str()));
+            // Built from the generated data, never by parsing: the test states
+            // what the payload should be, rather than restating how `data_of`
+            // computes it.
+            for (frame, lines) in decoded.iter().zip(&frames) {
+                let texts: Vec<&str> = lines.iter().filter_map(Line::data).collect();
+                let expected = if texts.is_empty() {
+                    None
+                } else {
+                    Some(texts.join("\n"))
+                };
+                let payload = data_of(frame);
+                prop_assert_eq!(payload, expected);
             }
         }
     }
