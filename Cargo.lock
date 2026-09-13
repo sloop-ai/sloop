@@ -5163,12 +5163,14 @@ name = "sloop-harness"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "futures",
  "proptest",
  "reqwest",
  "serde",
  "serde_json",
  "sloop-memory-core",
+ "tempfile",
  "tokio",
 ]
 

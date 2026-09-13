@@ -28,6 +28,11 @@ futures = "0.3"
 # macros is for the #[tokio::main] the binary will take, and the runtime is
 # multi-thread because sloop-memory-core's lancedb work is async too.
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# The chunker reads `captured` out of the transcript's frontmatter, and the
+# filename carries the same date, so both need a real local date rather than a
+# build-time constant. Both sibling crates already depend on chrono, so this
+# adds no crate to the lock file.
+chrono = "0.4"
 # snafu is the house rule, but the harness reports failures to a person at a
 # terminal rather than to a caller that branches on them, so a typed enum would
 # buy a decision nothing makes. Both sibling crates already use anyhow.
@@ -38,6 +43,10 @@ anyhow = "1"
 # replay properties must hold wherever the forks sit, not only where a test
 # author thought to put one.
 proptest = "1"
+# `record` is the one function here that touches the disk, so the only way to
+# test it is to give it a real directory. sloop-memory-core's tests already
+# use tempfile.
+tempfile = "3"
 
 [lints]
 workspace = true

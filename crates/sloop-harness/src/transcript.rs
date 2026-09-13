@@ -1,10 +1,4 @@
 //! Rendering a conversation tree as markdown for the memory index.
-//!
-//! Nothing in the binary calls [`render`] yet -- the step that names a file
-//! and writes it is a later one -- so under `not(test)` the whole module is
-//! dead. The expectation covers the module rather than each item so that it
-//! comes off in one place once that caller lands.
-#![cfg_attr(not(test), expect(dead_code, reason = "see above"))]
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
@@ -179,6 +173,58 @@ fn write_spine(out: &mut String, tree: &Tree) {
     out.push_str(&asides);
 }
 
+/// Longest slug allowed, in characters, before the date and extension.
+///
+/// 60 keeps the whole name well inside the 255-byte component limit every
+/// filesystem this runs on enforces, with room for the date, the extension,
+/// and a title whose first line is a paragraph.
+const SLUG_CHARS: usize = 60;
+
+/// A filesystem-safe, readable stem for this session.
+///
+/// The stem is not cosmetic: the indexer passes it to the chunker as the note
+/// title, and the chunker prepends it to the text of every chunk in the file.
+/// A session id here would put a session id in every embedding.
+///
+/// ASCII-only, which mangles a title in any other script down to the fallback.
+/// The trade is taken for the manifest's sake rather than for portability:
+/// macOS normalizes filenames to NFD while the string written here is NFC, so
+/// a non-ASCII name read back off the disk is not byte-equal to the one
+/// written. The indexer keys its manifest on the relative path, so the same
+/// session would look like two files. A dull name indexes correctly; a pretty
+/// one indexes twice.
+///
+/// The fallback is `{captured}-session.md` rather than a bare date: the stem
+/// is a chunk prefix, and "2026-09-13" alone reads as a date stamp on the
+/// content instead of as what the file is.
+///
+/// Two sessions whose titles slug the same on the same day land on the same
+/// name, and the second overwrites the first. That is inherent to naming by
+/// content rather than by id, and it is the same property that makes the
+/// caller's rewrite idempotent.
+#[must_use]
+pub fn filename(tree: &Tree, captured: &str) -> String {
+    let mut slug = String::new();
+    let mut last_dash = true;
+    for c in title_of(tree).chars() {
+        if c.is_ascii_alphanumeric() {
+            slug.extend(c.to_lowercase());
+            last_dash = false;
+        } else if !last_dash {
+            slug.push('-');
+            last_dash = true;
+        }
+        if slug.chars().count() >= SLUG_CHARS {
+            break;
+        }
+    }
+    let slug = slug.trim_matches('-');
+    if slug.is_empty() {
+        return format!("{captured}-session.md");
+    }
+    format!("{captured}-{slug}.md")
+}
+
 /// Render the whole tree as one markdown document.
 ///
 /// `captured` is an ISO date. It goes into frontmatter under the key `type`
@@ -206,8 +252,79 @@ pub fn render(tree: &Tree, captured: &str) -> String {
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "a test reports failure by panicking")]
 mod tests {
-    use super::render;
+    use super::{filename, render};
     use crate::tree::{ContentBlock, Role, Tree};
+
+    #[test]
+    fn a_filename_is_the_date_and_a_slug_of_the_opening_question() {
+        let tree = Tree::new(ContentBlock::text("How should the cache expire?"));
+
+        assert_eq!(
+            filename(&tree, "2026-09-13"),
+            "2026-09-13-how-should-the-cache-expire.md"
+        );
+    }
+
+    /// Casing and punctuation both have to go: the stem is a path component,
+    /// and `/` would silently write into a subdirectory -- or fail -- rather
+    /// than name a file.
+    #[test]
+    fn punctuation_and_casing_never_reach_the_name() {
+        let tree = Tree::new(ContentBlock::text("Cache/TTL: Why NOT?"));
+
+        assert_eq!(
+            filename(&tree, "2026-09-13"),
+            "2026-09-13-cache-ttl-why-not.md"
+        );
+    }
+
+    /// A title is a whole first line, and a first line can be a paragraph.
+    /// The cap is what keeps the name inside every filesystem's component
+    /// limit; it truncates mid-word rather than at a word boundary, which is
+    /// ugly and is the price of the bound being on the name, not the prose.
+    #[test]
+    fn a_long_title_is_cut_at_the_cap() {
+        let tree = Tree::new(ContentBlock::text(
+            "How should the cache expire when the process restarts and the disk fills up?",
+        ));
+
+        assert_eq!(
+            filename(&tree, "2026-09-13"),
+            "2026-09-13-how-should-the-cache-expire-when-the-process-restarts-and-th.md"
+        );
+    }
+
+    /// All-punctuation slugs to nothing, and the fallback has to be a name a
+    /// person can still read as a transcript rather than a bare date.
+    #[test]
+    fn a_title_of_pure_punctuation_falls_back() {
+        let tree = Tree::new(ContentBlock::text("!!! ???"));
+
+        assert_eq!(filename(&tree, "2026-09-13"), "2026-09-13-session.md");
+    }
+
+    /// The slug is ASCII-only, so a title in another script reaches the same
+    /// fallback -- see [`filename`] for why that trade is taken deliberately.
+    #[test]
+    fn a_non_ascii_title_falls_back_too() {
+        let tree = Tree::new(ContentBlock::text("キャッシュはどう失効させるべき?"));
+
+        assert_eq!(filename(&tree, "2026-09-13"), "2026-09-13-session.md");
+    }
+
+    /// An empty opening block has no first line at all, so it never reaches
+    /// the slug: `title_of` substitutes its own placeholder first, and that is
+    /// what gets slugged. Distinct from the fallback above, and worth pinning
+    /// so a change to either one cannot quietly take over the other's case.
+    #[test]
+    fn an_empty_opening_block_is_named_from_the_placeholder_title() {
+        let tree = Tree::new(ContentBlock::text(""));
+
+        assert_eq!(
+            filename(&tree, "2026-09-13"),
+            "2026-09-13-untitled-session.md"
+        );
+    }
 
     #[test]
     fn a_linear_session_renders_as_turns_under_a_title() {

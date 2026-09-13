@@ -14,10 +14,10 @@
 //! carry. Every run spends tokens; there is no offline mode.
 
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Error, Result};
-use sloop_memory_core::config::{db_dir, TABLE_CHUNKS};
+use anyhow::{anyhow, Context as _, Error, Result};
+use sloop_memory_core::config::{self, db_dir, TABLE_CHUNKS};
 use sloop_memory_core::index::is_indexable;
 
 mod api;
@@ -31,8 +31,49 @@ use tree::{ContentBlock, NodeId, Role, Status, Tree};
 /// the question is scenery, and the branching is the subject.
 const DEFAULT_PROMPT: &str = "How should the cache expire?";
 
+/// The root label a session is written to.
+const TRANSCRIPT_ROOT: &str = "transcripts";
+
 fn rejected_id() -> Error {
     anyhow!("a node id was rejected by the tree that minted it")
+}
+
+/// Where to write this session, or why it is not being written.
+///
+/// Returns `Err` with a message rather than an `anyhow::Error` because the
+/// caller reports it and carries on: a run without the root configured is a
+/// legitimate way to use the harness, and failing the turn over it would be
+/// the wrong trade.
+///
+/// Takes label/path pairs rather than `config::Roots` because a `config::Root`
+/// cannot be built outside `sloop-memory-core` -- `RootDir`'s only constructor
+/// is private, deliberately, so that every root on the type has been proved to
+/// exist. Pairs are what this actually needs, and they keep the test off the
+/// filesystem.
+fn transcript_dir(roots: &[(&str, &Path)]) -> Result<PathBuf, String> {
+    for (label, dir) in roots {
+        if *label == TRANSCRIPT_ROOT {
+            return Ok(dir.to_path_buf());
+        }
+    }
+    Err(format!(
+        "no root labelled '{TRANSCRIPT_ROOT}' is configured, so this session is not being recorded"
+    ))
+}
+
+/// Write the whole session to its file, replacing what is there.
+///
+/// A full rewrite rather than an append: it is idempotent, so there is no
+/// partial-write state to recover, and the indexer's manifest hash makes an
+/// unchanged rewrite free. The daemon's watcher picks it up after
+/// `WATCH_DEBOUNCE_SECS` -- the harness never touches the index itself, which
+/// is what keeps the two from racing on the same rows.
+fn record(dir: &Path, tree: &Tree) -> Result<PathBuf> {
+    let captured = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let path = dir.join(transcript::filename(tree, &captured));
+    std::fs::write(&path, transcript::render(tree, &captured))
+        .with_context(|| format!("writing the session transcript to {}", path.display()))?;
+    Ok(path)
 }
 
 #[tokio::main]
@@ -53,12 +94,34 @@ async fn main() -> Result<()> {
     // at startup rather than after the first turn is half built.
     let api = Api::from_env()?;
 
+    // Resolved once, before any tokens are spent, so a misconfigured root is
+    // reported at the top of the run rather than after the first turn. Both
+    // failures are survivable: a run that cannot be recorded is still a run.
+    let dir = match config::roots() {
+        Ok(roots) => {
+            let pairs: Vec<(&str, &Path)> = roots
+                .iter()
+                .map(|root| (root.label.as_str(), root.dir.as_path()))
+                .collect();
+            transcript_dir(&pairs)
+        }
+        Err(error) => Err(format!(
+            "the indexing roots could not be read, so this session is not being recorded: {error}"
+        )),
+    };
+    if let Err(why) = &dir {
+        line(&format!("note: {why}"))?;
+    }
+
     let mut tree = Tree::new(ContentBlock::text(&prompt));
     let root = tree.root();
 
     line("\nturn 1  streaming...")?;
     let first = turn(&api, &tree, root).await?;
     let kept = graft(&mut tree, root, first.blocks)?;
+    if let Ok(dir) = &dir {
+        line(&format!("recorded {}", record(dir, &tree)?.display()))?;
+    }
 
     // The fork is a *sibling* of the node it hangs off, not a continuation of
     // it. Where it hangs is `fork_point`'s decision: inside the turn when the
@@ -72,6 +135,9 @@ async fn main() -> Result<()> {
     line("\nfork, abandon, regenerate\n\nturn 1' streaming...")?;
     let second = turn(&api, &tree, fork_at).await?;
     let abandoned = graft(&mut tree, fork_at, second.blocks)?;
+    if let Ok(dir) = &dir {
+        line(&format!("recorded {}", record(dir, &tree)?.display()))?;
+    }
     let [abandoned_divergence, ..] = abandoned.as_slice() else {
         return Err(anyhow!(
             "the regenerated turn came back with no content blocks, so there is no second branch"
@@ -241,7 +307,67 @@ fn line(text: &str) -> Result<()> {
     reason = "a test reports failure by panicking, and an unwrap is one way"
 )]
 mod tests {
-    use super::{fork_point, graft, summarize, ContentBlock, Status, Tree};
+    use std::path::{Path, PathBuf};
+
+    use super::{
+        fork_point, graft, record, summarize, transcript, transcript_dir, ContentBlock, Status,
+        Tree,
+    };
+
+    // A missing `transcripts` root is a configuration state, not a failure: the
+    // harness's job is the turn, and a run without the root configured must still
+    // complete. It has to say so, though -- silently not recording is the failure
+    // mode this whole slice exists to remove.
+    #[test]
+    fn a_missing_transcripts_root_is_reported_and_not_fatal() {
+        let roots = Vec::new();
+        assert_eq!(
+            transcript_dir(&roots),
+            Err(
+                "no root labelled 'transcripts' is configured, so this session is not being \
+                 recorded"
+                    .to_owned()
+            )
+        );
+    }
+
+    // The label selects, not the position. A `transcripts` root that is neither
+    // first nor last is the case that tells those two apart.
+    #[test]
+    fn the_transcripts_root_is_found_among_others_by_its_label() {
+        let roots = vec![
+            ("notes", Path::new("/roots/notes")),
+            ("transcripts", Path::new("/roots/sessions")),
+            ("memory", Path::new("/roots/memory")),
+        ];
+
+        assert_eq!(transcript_dir(&roots), Ok(PathBuf::from("/roots/sessions")));
+    }
+
+    /// `record` derives the name rather than using a fixed one, and writes the
+    /// rendered document under it.
+    ///
+    /// Both halves are needed. A fixed name still produces a file the daemon
+    /// indexes, so nothing downstream would notice that every session on the
+    /// machine had been overwriting one note.
+    #[test]
+    fn a_session_is_written_under_its_derived_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = Tree::new(ContentBlock::text("How should the cache expire?"));
+        let captured = chrono::Local::now().format("%Y-%m-%d").to_string();
+
+        let path = record(dir.path(), &tree).unwrap();
+
+        assert_eq!(
+            path,
+            dir.path()
+                .join(format!("{captured}-how-should-the-cache-expire.md"))
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            transcript::render(&tree, &captured)
+        );
+    }
 
     #[test]
     fn a_summary_names_the_kind_and_keeps_only_the_first_line() {

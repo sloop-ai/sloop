@@ -232,9 +232,6 @@ impl Tree {
     }
 
     /// This node's role.
-    // Only `transcript` reads this, and that module is itself dead under
-    // not(test) until the writer lands. Drop the attribute with it.
-    #[cfg_attr(not(test), expect(dead_code, reason = "see above"))]
     #[must_use]
     pub fn role(&self, id: NodeId) -> Option<Role> {
         Some(self.node(id)?.role)
