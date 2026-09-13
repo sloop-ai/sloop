@@ -50,7 +50,67 @@ fn group(tree: &Tree, path: &[NodeId]) -> Vec<Group> {
     groups
 }
 
+/// The run of fence characters this line opens or closes with, or `None` when
+/// the line is not a fence.
+///
+/// The predicate has to be the chunker's, character for character: three or
+/// more backticks or tildes after leading whitespace, which is what
+/// `parse_note` toggles its fence flag on. Anything looser or tighter here and
+/// the balancing below counts a different set of lines than the reader does.
+///
+/// The whole run comes back rather than just three characters so that a closer
+/// this module emits matches the opener it is closing. The chunker does not
+/// care -- three is enough to toggle it -- but a four-backtick block wrapping a
+/// three-backtick one is real markdown, and closing it with three would end the
+/// wrong block for every other reader.
+fn fence_marker(line: &str) -> Option<&str> {
+    let line = line.trim_start();
+    let first = line.chars().next()?;
+    if first != '`' && first != '~' {
+        return None;
+    }
+    let run = line.len() - line.trim_start_matches(first).len();
+    if run < 3 {
+        return None;
+    }
+    Some(&line[..run])
+}
+
+/// The marker that would close this text's last unterminated fence, or `None`
+/// when its fences already balance.
+fn unclosed_fence(text: &str) -> Option<&str> {
+    let mut open = None;
+    for line in text.lines() {
+        let Some(marker) = fence_marker(line) else {
+            continue;
+        };
+        open = match open {
+            None => Some(marker),
+            Some(_) => None,
+        };
+    }
+    open
+}
+
 /// Write one group's blocks as labelled paragraphs.
+///
+/// The label stays inline with the text -- `**assistant:** ...` -- unless the
+/// block opens on a code fence, which is given its own line. Always breaking
+/// after the label would drop the condition, at the cost of a line and a token
+/// on every block in a corpus that is overwhelmingly prose and is read by an
+/// agent paying for each one. One string comparison buys the common case back.
+///
+/// The break is not typography. `parse_note` toggles a fence flag on any line
+/// that starts with a fence and ignores headings while it is set, so an opening
+/// fence swallowed into `**assistant:** ` never toggles while the closer on its
+/// own line does. The flag is then stuck on for the rest of the file and every
+/// heading below reads as code -- including the `### Not continued` that is the
+/// only thing marking an abandoned branch as abandoned.
+///
+/// Moving the label is not sufficient on its own, which is why the block is
+/// also balanced. A turn interrupted mid-fence already has its opening fence on
+/// its own line; what it lacks is the closer, and an unterminated fence leaks
+/// into the next heading exactly the same way.
 fn write_group(out: &mut String, tree: &Tree, g: &Group) {
     let label = match g.role {
         Role::User => "user",
@@ -60,10 +120,20 @@ fn write_group(out: &mut String, tree: &Tree, g: &Group) {
         let Some(text) = tree.block(*id).and_then(text_of) else {
             continue;
         };
-        if text.trim().is_empty() {
+        let text = text.trim();
+        if text.is_empty() {
             continue;
         }
-        let _ = writeln!(out, "**{label}:** {}\n", text.trim());
+        let opens_on_fence = text
+            .lines()
+            .next()
+            .is_some_and(|l| fence_marker(l).is_some());
+        let gap = if opens_on_fence { '\n' } else { ' ' };
+        let _ = writeln!(out, "**{label}:**{gap}{text}");
+        if let Some(marker) = unclosed_fence(text) {
+            let _ = writeln!(out, "{marker}");
+        }
+        out.push('\n');
     }
 }
 
@@ -615,6 +685,298 @@ captured: 2026-09-13
 **user:** How should the cache expire?
 
 **assistant:** Expire on write.
+"
+        );
+    }
+
+    // ---- code fences ----------------------------------------------------
+    //
+    // The four tests below pin the bytes this renderer emits around a code
+    // fence. Their counterparts in `sloop-memory-core`'s `chunk.rs` copy those
+    // bytes into fixtures and put them through the real `parse_note`, which is
+    // the assertion that actually matters: that `### Not continued` still
+    // reaches `heading_path`. `parse_note` is `pub(crate)` there and cannot be
+    // called from this crate, so the pair is split across two crates on
+    // purpose. Change the shape here and the fixtures there must change in the
+    // same commit, or they go on passing against markdown nothing produces.
+
+    /// A reply that opens on a fence puts the fence on its own line.
+    ///
+    /// Inline, the opening fence would be swallowed into `**assistant:** ` and
+    /// never toggle the chunker's fence flag, while its closer on the next line
+    /// would -- leaving the flag stuck on and every heading after it, this
+    /// document's own `### Not continued` included, read as code.
+    #[test]
+    fn a_reply_opening_on_a_fence_starts_its_own_line() {
+        let mut tree = Tree::new(ContentBlock::text("How should the cache expire?"));
+        let root = tree.root();
+        let reply = tree
+            .append(
+                root,
+                Role::Assistant,
+                ContentBlock::text(
+                    "```rust\nfn expire(entry: &mut Entry) {\n    entry.stale = true;\n}\n```",
+                ),
+            )
+            .unwrap();
+        let tip = tree
+            .append(
+                reply,
+                Role::User,
+                ContentBlock::text("Does that handle reads?"),
+            )
+            .unwrap();
+        tree.append(root, Role::Assistant, ContentBlock::text("TTL at 60s."))
+            .unwrap();
+
+        assert_eq!(
+            render(&tree, tip, "2026-09-13").unwrap(),
+            "\
+---
+type: transcript
+captured: 2026-09-13
+---
+
+# How should the cache expire?
+
+## Turn 1
+
+**user:** How should the cache expire?
+
+**assistant:**
+```rust
+fn expire(entry: &mut Entry) {
+    entry.stale = true;
+}
+```
+
+### Not continued
+
+> **assistant:** TTL at 60s.
+
+## Turn 2
+
+**user:** Does that handle reads?
+"
+        );
+    }
+
+    /// The same rule on the user side. An opening prompt that is a pasted code
+    /// block also makes the H1 the fence line itself -- which is a heading, not
+    /// a fence, because `#` comes first -- so the turn body is the only place
+    /// the fence can do damage.
+    #[test]
+    fn a_prompt_opening_on_a_fence_starts_its_own_line() {
+        let mut tree = Tree::new(ContentBlock::text(
+            "```rust\nfn expire(entry: &mut Entry) {}\n```",
+        ));
+        let root = tree.root();
+        let tip = tree
+            .append(
+                root,
+                Role::Assistant,
+                ContentBlock::text("That never marks the entry stale."),
+            )
+            .unwrap();
+        tree.append(
+            root,
+            Role::Assistant,
+            ContentBlock::text("Looks correct to me."),
+        )
+        .unwrap();
+
+        assert_eq!(
+            render(&tree, tip, "2026-09-13").unwrap(),
+            "\
+---
+type: transcript
+captured: 2026-09-13
+---
+
+# ```rust
+
+## Turn 1
+
+**user:**
+```rust
+fn expire(entry: &mut Entry) {}
+```
+
+**assistant:** That never marks the entry stale.
+
+### Not continued
+
+> **assistant:** Looks correct to me.
+"
+        );
+    }
+
+    /// A turn interrupted inside a fence gets the fence closed for it.
+    ///
+    /// Steering mid-turn is a first-class shape here -- the partial reply is
+    /// kept and a user block is appended under it -- so a response that stops
+    /// inside a code block is a transcript this renderer has to emit. Moving
+    /// the label off the line does nothing for it: the fence already starts its
+    /// own line and is simply never closed, which swallows the rest of the
+    /// document just as thoroughly.
+    #[test]
+    fn a_turn_interrupted_inside_a_fence_is_closed() {
+        let mut tree = Tree::new(ContentBlock::text("How should the cache expire?"));
+        let root = tree.root();
+        let partial = tree
+            .append(
+                root,
+                Role::Assistant,
+                ContentBlock::text("Like this:\n```rust\nfn expire(entry: &mut Entry) {"),
+            )
+            .unwrap();
+        let steer = tree
+            .append(partial, Role::User, ContentBlock::text("Stop, wrong file."))
+            .unwrap();
+        let tip = tree
+            .append(
+                steer,
+                Role::Assistant,
+                ContentBlock::text("Expire on write."),
+            )
+            .unwrap();
+        tree.append(steer, Role::Assistant, ContentBlock::text("TTL at 60s."))
+            .unwrap();
+
+        assert_eq!(
+            render(&tree, tip, "2026-09-13").unwrap(),
+            "\
+---
+type: transcript
+captured: 2026-09-13
+---
+
+# How should the cache expire?
+
+## Turn 1
+
+**user:** How should the cache expire?
+
+**assistant:** Like this:
+```rust
+fn expire(entry: &mut Entry) {
+```
+
+## Turn 2
+
+**user:** Stop, wrong file.
+
+**assistant:** Expire on write.
+
+### Not continued
+
+> **assistant:** TTL at 60s.
+"
+        );
+    }
+
+    /// An aside needs none of this and is left alone.
+    ///
+    /// Every line of an aside is prefixed with `> `, so a fenced line inside
+    /// one does not start with a fence after `trim_start` and never toggles the
+    /// chunker's flag whether it balances or not. The quoting is the whole
+    /// protection, and this pins that it stays the whole protection.
+    ///
+    /// The aside is built by the same [`write_group`], so it picks up the line
+    /// break and the closer anyway. That is worth having for a different
+    /// reason: a blockquote holding an unterminated fence is malformed markdown
+    /// to anyone reading the file, chunker or not.
+    #[test]
+    fn a_fence_inside_an_aside_stays_quoted() {
+        let mut tree = Tree::new(ContentBlock::text("How should the cache expire?"));
+        let root = tree.root();
+        let reply = tree
+            .append(
+                root,
+                Role::Assistant,
+                ContentBlock::text("Expire on write."),
+            )
+            .unwrap();
+        let tip = tree
+            .append(
+                reply,
+                Role::User,
+                ContentBlock::text("Does that handle reads?"),
+            )
+            .unwrap();
+        tree.append(
+            root,
+            Role::Assistant,
+            ContentBlock::text("```rust\nfn ttl() {}"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            render(&tree, tip, "2026-09-13").unwrap(),
+            "\
+---
+type: transcript
+captured: 2026-09-13
+---
+
+# How should the cache expire?
+
+## Turn 1
+
+**user:** How should the cache expire?
+
+**assistant:** Expire on write.
+
+### Not continued
+
+> **assistant:**
+> ```rust
+> fn ttl() {}
+> ```
+
+## Turn 2
+
+**user:** Does that handle reads?
+"
+        );
+    }
+
+    /// The closer matches the marker it is closing.
+    ///
+    /// The chunker would be satisfied by backticks either way -- it toggles on
+    /// both markers and never pairs them -- so nothing about the abandonment
+    /// heading depends on this. Every other reader of the file does: closing a
+    /// tilde block with backticks leaves both fences open.
+    #[test]
+    fn an_unclosed_tilde_fence_is_closed_with_tildes() {
+        let mut tree = Tree::new(ContentBlock::text("How should the cache expire?"));
+        let root = tree.root();
+        let tip = tree
+            .append(
+                root,
+                Role::Assistant,
+                ContentBlock::text("~~~rust\nfn expire() {"),
+            )
+            .unwrap();
+
+        assert_eq!(
+            render(&tree, tip, "2026-09-13").unwrap(),
+            "\
+---
+type: transcript
+captured: 2026-09-13
+---
+
+# How should the cache expire?
+
+## Turn 1
+
+**user:** How should the cache expire?
+
+**assistant:**
+~~~rust
+fn expire() {
+~~~
 "
         );
     }

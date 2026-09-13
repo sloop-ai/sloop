@@ -147,6 +147,17 @@ as an aside. A tip the tree never minted renders nothing, rather than falling
 back to a branch that would read as a faithful transcript of the wrong
 conversation.
 
+**Every block leaves code fences balanced, and a block that opens on a fence
+puts it on its own line.** `parse_note` ignores headings while its fence flag
+is set, so any transcript that leaves a fence open erases every heading below
+it -- the `### Not continued` that carries the whole design included. Two ways
+in: a fence swallowed into `**assistant:** ` never toggles the flag while its
+closer does, and a turn interrupted mid-fence never closes at all. Both are
+handled in the renderer, so nothing downstream has to know. Asides need
+neither -- `> ` in front of a fence means it is no longer a fence -- but get
+both anyway, because they share the same writer and a blockquote around an
+unterminated fence is malformed for every reader.
+
 The alternative, rendering every branch as a peer section, was rejected.
 Branches share prefixes in the tree and a flat render does not, so it must
 either duplicate the shared prefix into every section -- putting near-identical
