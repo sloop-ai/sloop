@@ -21,6 +21,7 @@ use sloop_memory_core::config::{db_dir, TABLE_CHUNKS};
 use sloop_memory_core::index::is_indexable;
 
 mod api;
+mod transcript;
 mod tree;
 
 use api::{Api, Turn};
