@@ -19,27 +19,37 @@ const MAX_CHARS: usize = 2000;
 /// Carried between splits so a fact spanning the cut is still retrievable.
 const OVERLAP_CHARS: usize = 200;
 
+/// One indexed unit: a section, or a slice of one too long to embed whole.
 #[derive(Debug, Clone)]
-pub(crate) struct Chunk {
+pub struct Chunk {
     /// What actually gets embedded and full-text indexed: context header + body.
-    pub(crate) text: String,
-    pub(crate) heading_path: String,
-    pub(crate) ix: i32,
-    pub(crate) entities: Vec<String>,
+    pub text: String,
+    /// The `>`-joined headings above this chunk, keyed per section rather than
+    /// per chunk -- so a section split across several chunks repeats its path
+    /// on every one of them.
+    pub heading_path: String,
+    /// Position within the file, in document order.
+    pub ix: i32,
+    /// Every `[[wikilink]]` target found in the body.
+    pub entities: Vec<String>,
 }
 
+/// The three YAML keys the indexer reads. Absent keys come back empty rather
+/// than missing, so a note without frontmatter parses like one with blank
+/// values.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct Frontmatter {
-    pub(crate) note_type: String,
-    pub(crate) captured: String,
-    pub(crate) tags: Vec<String>,
+pub struct Frontmatter {
+    pub note_type: String,
+    pub captured: String,
+    pub tags: Vec<String>,
 }
 
+/// A whole markdown file, chunked.
 #[derive(Debug, Clone)]
-pub(crate) struct ParsedNote {
-    pub(crate) title: String,
-    pub(crate) frontmatter: Frontmatter,
-    pub(crate) chunks: Vec<Chunk>,
+pub struct ParsedNote {
+    pub title: String,
+    pub frontmatter: Frontmatter,
+    pub chunks: Vec<Chunk>,
 }
 
 /// Minimal YAML: enough for `type`, `captured` and `tags`, in either inline
@@ -200,7 +210,20 @@ fn split_body(body: &str) -> Vec<String> {
         .collect()
 }
 
-pub(crate) fn parse_note(title: &str, source: &str) -> ParsedNote {
+/// Chunk one markdown file.
+///
+/// `title` is the filename stem rather than the H1 (see `index::note_title`),
+/// and it is prepended to every chunk's embedded text as
+/// `"{title} > {heading_path}"` -- which is how a heading travels into the
+/// vector and BM25 sides as well as into the rendered pointer.
+///
+/// Public so that producers of markdown can test what the chunker makes of
+/// their output. `sloop-harness`'s transcript renderer is the case that needs
+/// it: the safety of the whole transcript design rests on a `### Not
+/// continued` heading reaching `heading_path`, and that is a property of the
+/// two together, not of either alone.
+#[must_use]
+pub fn parse_note(title: &str, source: &str) -> ParsedNote {
     let lines: Vec<&str> = source.lines().collect();
     let (frontmatter, start) = parse_frontmatter(&lines);
 
@@ -363,141 +386,5 @@ mod tests {
         assert_eq!(note.frontmatter.captured, "2026-04-10");
         assert_eq!(note.frontmatter.tags, vec!["infra", "caching"]);
         assert!(!note.chunks.iter().any(|c| c.text.contains("captured:")));
-    }
-
-    // ---- harness transcripts -------------------------------------------
-    //
-    // The fixtures below are copies of what `sloop-harness`'s
-    // `transcript::write_group` emits, and they are only worth anything while
-    // they stay copies. `sloop-harness` cannot call `parse_note` -- it is
-    // `pub(crate)` here -- so the renderer's own tests pin the bytes and these
-    // pin what the chunker makes of them. Change the renderer and both move
-    // together, or these keep passing against a shape nothing produces.
-    //
-    // What they assert is the one thing the transcript design rests on: a
-    // `### Not continued` heading reaches `heading_path`, so a hit inside a
-    // branch that was tried and dropped says so without any consumer having to
-    // remember. `parse_note` ignores headings inside a fence, so any transcript
-    // that leaves a fence unbalanced erases every heading after it.
-
-    fn heading_paths(source: &str) -> Vec<String> {
-        parse_note("Session", source)
-            .chunks
-            .iter()
-            .map(|c| c.heading_path.clone())
-            .collect()
-    }
-
-    fn abandonment_survives(source: &str) {
-        let paths = heading_paths(source);
-        assert!(
-            paths.iter().any(|p| p.ends_with("Not continued")),
-            "the abandoned branch lost its heading: {paths:?}"
-        );
-    }
-
-    /// An assistant reply that opens on a code fence.
-    #[test]
-    fn a_reply_opening_on_a_fence_leaves_the_headings_below_it_intact() {
-        abandonment_survives(
-            "\
----
-type: transcript
-captured: 2026-09-13
----
-
-# How should the cache expire?
-
-## Turn 1
-
-**user:** How should the cache expire?
-
-**assistant:**
-```rust
-fn expire(entry: &mut Entry) {
-    entry.stale = true;
-}
-```
-
-### Not continued
-
-> **assistant:** TTL at 60s.
-
-## Turn 2
-
-**user:** Does that handle reads?
-",
-        );
-    }
-
-    /// An opening prompt that is a pasted code block. The H1 is then the fence
-    /// line itself, which is a heading and not a fence -- `#` comes first --
-    /// so the damage, if any, starts at the user block in the turn body.
-    #[test]
-    fn an_opening_prompt_of_pasted_code_leaves_the_headings_below_it_intact() {
-        abandonment_survives(
-            "\
----
-type: transcript
-captured: 2026-09-13
----
-
-# ```rust
-
-## Turn 1
-
-**user:**
-```rust
-fn expire(entry: &mut Entry) {}
-```
-
-**assistant:** That never marks the entry stale.
-
-### Not continued
-
-> **assistant:** Looks correct to me.
-",
-        );
-    }
-
-    /// A turn steered mid-fence: the reply is interrupted inside a code block
-    /// and never closes it. Putting the label on its own line does nothing
-    /// here -- the fence already starts one -- so the renderer has to close the
-    /// block itself.
-    #[test]
-    fn a_turn_interrupted_inside_a_fence_leaves_the_headings_below_it_intact() {
-        let source = "\
----
-type: transcript
-captured: 2026-09-13
----
-
-# How should the cache expire?
-
-## Turn 1
-
-**user:** How should the cache expire?
-
-**assistant:** Like this:
-```rust
-fn expire(entry: &mut Entry) {
-```
-
-## Turn 2
-
-**user:** Stop, wrong file.
-
-**assistant:** Expire on write.
-
-### Not continued
-
-> **assistant:** TTL at 60s.
-";
-        abandonment_survives(source);
-        let paths = heading_paths(source);
-        assert!(
-            paths.iter().any(|p| p.ends_with("Turn 2")),
-            "the turn after the interrupted one was swallowed: {paths:?}"
-        );
     }
 }

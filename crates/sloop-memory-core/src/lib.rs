@@ -5,7 +5,7 @@
 //! daemon, MCP server, and prompt-hook client, and future consumers can do
 //! the same without spawning a subprocess.
 
-pub(crate) mod chunk;
+pub mod chunk;
 pub mod client;
 pub mod config;
 pub mod embed;

@@ -327,6 +327,8 @@ pub fn render(tree: &Tree, tip: NodeId, captured: &str) -> Option<String> {
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "a test reports failure by panicking")]
 mod tests {
+    use sloop_memory_core::chunk::{parse_note, ParsedNote};
+
     use super::{filename, render};
     use crate::tree::{ContentBlock, Role, Tree};
 
@@ -692,13 +694,9 @@ captured: 2026-09-13
     // ---- code fences ----------------------------------------------------
     //
     // The four tests below pin the bytes this renderer emits around a code
-    // fence. Their counterparts in `sloop-memory-core`'s `chunk.rs` copy those
-    // bytes into fixtures and put them through the real `parse_note`, which is
-    // the assertion that actually matters: that `### Not continued` still
-    // reaches `heading_path`. `parse_note` is `pub(crate)` there and cannot be
-    // called from this crate, so the pair is split across two crates on
-    // purpose. Change the shape here and the fixtures there must change in the
-    // same commit, or they go on passing against markdown nothing produces.
+    // fence. What those bytes have to be *worth* is asserted separately, under
+    // "the renderer/chunker contract" at the end of this module, which puts
+    // real rendered output through the real `parse_note`.
 
     /// A reply that opens on a fence puts the fence on its own line.
     ///
@@ -978,6 +976,221 @@ captured: 2026-09-13
 fn expire() {
 ~~~
 "
+        );
+    }
+
+    // ---- the renderer/chunker contract -----------------------------------
+    //
+    // Everything above pins bytes. These pin what the chunker makes of them,
+    // which is the property the transcript design actually rests on: a
+    // `### Not continued` heading has to reach `heading_path`, because that is
+    // the only thing marking a dropped branch as dropped, on both retrieval
+    // paths and with no consumer having to remember a filter.
+    //
+    // It is a property of the renderer and the chunker together, so neither
+    // crate's own tests can see it. `parse_note` is public for exactly this.
+    // Nothing here is a fixture: the markdown under test is what `record`
+    // wrote, built by the `graft`/`fork_point` sequence `main` uses.
+
+    /// Replay `main`'s build order over two canned turns, then chunk the file
+    /// it wrote.
+    ///
+    /// The turns are canned because the API is not. Everything downstream of
+    /// them is the real path -- `main` grafts the kept turn, asks `fork_point`
+    /// where the second hangs, grafts it there, and records with the kept tip
+    /// still live -- so a renderer change cannot pass here against a shape the
+    /// harness does not emit.
+    ///
+    /// The title comes back from the filename `record` chose, not from a
+    /// constant, because `parse_note` takes the filename stem and prepends it
+    /// to every chunk's embedded text.
+    fn chunked_session(
+        prompt: &str,
+        kept: Vec<ContentBlock>,
+        abandoned: Vec<ContentBlock>,
+    ) -> ParsedNote {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tree = Tree::new(ContentBlock::text(prompt));
+        let root = tree.root();
+
+        let first = crate::graft(&mut tree, root, kept).unwrap();
+        let live = *first.last().unwrap();
+        let (fork_at, _) = crate::fork_point(&tree, root, &first).unwrap();
+        crate::graft(&mut tree, fork_at, abandoned).unwrap();
+
+        let path = crate::record(dir.path(), &tree, live).unwrap();
+        let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
+        parse_note(&stem, &std::fs::read_to_string(&path).unwrap())
+    }
+
+    #[track_caller]
+    fn abandonment_survives(note: &ParsedNote) {
+        let paths: Vec<&str> = note
+            .chunks
+            .iter()
+            .map(|c| c.heading_path.as_str())
+            .collect();
+        assert!(
+            paths.iter().any(|p| p.ends_with("Not continued")),
+            "the abandoned branch lost its heading: {paths:?}"
+        );
+    }
+
+    /// The plain shape, with no fence anywhere.
+    ///
+    /// Without it the three below prove only that fences do no *additional*
+    /// damage, and a renderer that stopped emitting the heading at all would
+    /// pass every one of them.
+    #[test]
+    fn a_dropped_branch_reaches_the_chunker_as_a_heading() {
+        let note = chunked_session(
+            "How should the cache expire?",
+            vec![ContentBlock::text("Expire on write.")],
+            vec![ContentBlock::text("TTL at 60s.")],
+        );
+
+        abandonment_survives(&note);
+    }
+
+    /// Frontmatter has to survive the round trip too. Empty is the failure
+    /// mode that shows up nowhere else: the pointer renderer reads both of
+    /// these, and a blank one degrades the pointer silently rather than
+    /// failing.
+    #[test]
+    fn a_recorded_session_carries_its_type_and_date_through_the_chunker() {
+        let note = chunked_session(
+            "How should the cache expire?",
+            vec![ContentBlock::text("Expire on write.")],
+            vec![ContentBlock::text("TTL at 60s.")],
+        );
+
+        assert_eq!(note.frontmatter.note_type, "transcript");
+        assert_eq!(
+            note.frontmatter.captured,
+            chrono::Local::now().format("%Y-%m-%d").to_string()
+        );
+    }
+
+    /// A reply that opens on a code fence.
+    ///
+    /// The regression this exists for: rendered inline, the opening fence was
+    /// swallowed into `**assistant:** ` and never toggled the chunker's fence
+    /// flag while its closer did, so the flag stayed set and the whole rest of
+    /// the document -- `### Not continued` included -- chunked as code.
+    #[test]
+    fn a_reply_opening_on_a_fence_leaves_the_heading_below_it_intact() {
+        let note = chunked_session(
+            "How should the cache expire?",
+            vec![ContentBlock::text(
+                "```rust\nfn expire(entry: &mut Entry) {\n    entry.stale = true;\n}\n```",
+            )],
+            vec![ContentBlock::text("TTL at 60s.")],
+        );
+
+        abandonment_survives(&note);
+    }
+
+    /// A turn interrupted inside a fence, which never closes it. Putting the
+    /// label on its own line does nothing here -- the fence already starts one
+    /// -- so the renderer has to close the block itself.
+    #[test]
+    fn a_turn_interrupted_inside_a_fence_leaves_the_heading_below_it_intact() {
+        let note = chunked_session(
+            "How should the cache expire?",
+            vec![ContentBlock::text(
+                "```rust\nfn expire(entry: &mut Entry) {",
+            )],
+            vec![ContentBlock::text("TTL at 60s.")],
+        );
+
+        abandonment_survives(&note);
+    }
+
+    /// An interrupted fence must not swallow the turns that follow it either.
+    ///
+    /// Distinct from the test above: the aside is written before the rest of
+    /// the spine, so a leaked fence can leave `### Not continued` intact and
+    /// still erase every heading after it. Nothing downstream would report
+    /// that -- the file simply chunks to fewer chunks than it has sections.
+    #[test]
+    fn an_interrupted_fence_does_not_swallow_the_turn_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tree = Tree::new(ContentBlock::text("How should the cache expire?"));
+        let root = tree.root();
+
+        let first = crate::graft(
+            &mut tree,
+            root,
+            vec![ContentBlock::text(
+                "```rust\nfn expire(entry: &mut Entry) {",
+            )],
+        )
+        .unwrap();
+        let (fork_at, _) = crate::fork_point(&tree, root, &first).unwrap();
+        crate::graft(&mut tree, fork_at, vec![ContentBlock::text("TTL at 60s.")]).unwrap();
+
+        // `graft` appends assistant blocks, and turns are numbered from user
+        // ones, so the follow-up is appended directly in order to open Turn 2.
+        let live = tree
+            .append(
+                *first.last().unwrap(),
+                Role::User,
+                ContentBlock::text("Does that handle reads?"),
+            )
+            .unwrap();
+
+        let path = crate::record(dir.path(), &tree, live).unwrap();
+        let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
+        let note = parse_note(&stem, &std::fs::read_to_string(&path).unwrap());
+
+        let paths: Vec<&str> = note
+            .chunks
+            .iter()
+            .map(|c| c.heading_path.as_str())
+            .collect();
+        assert!(
+            paths.iter().any(|p| p.ends_with("Turn 2")),
+            "the turn after the interrupted one was swallowed: {paths:?}"
+        );
+    }
+
+    /// The fence in the *opening prompt* rather than in a reply. That block is
+    /// rendered twice -- once as the H1, once in the turn body -- so it is the
+    /// one input that can leave a fence open in two places.
+    #[test]
+    fn an_opening_prompt_of_pasted_code_leaves_the_heading_below_it_intact() {
+        let note = chunked_session(
+            "```rust\nfn expire(entry: &mut Entry) {}\n```",
+            vec![ContentBlock::text("That never marks the entry stale.")],
+            vec![ContentBlock::text("Looks correct to me.")],
+        );
+
+        abandonment_survives(&note);
+    }
+
+    /// The abandoned branch alone must not be able to satisfy the assertion.
+    ///
+    /// A renderer that lost the spine and quoted everything would leave a
+    /// `Not continued` heading in place while recording the wrong conversation
+    /// as live, which is the defect this slice already shipped once.
+    #[test]
+    fn the_live_branch_is_not_itself_marked_not_continued() {
+        let note = chunked_session(
+            "How should the cache expire?",
+            vec![ContentBlock::text("Expire on write.")],
+            vec![ContentBlock::text("TTL at 60s.")],
+        );
+
+        let live: Vec<&str> = note
+            .chunks
+            .iter()
+            .filter(|c| c.text.contains("Expire on write."))
+            .map(|c| c.heading_path.as_str())
+            .collect();
+        assert!(!live.is_empty(), "the live reply reached no chunk at all");
+        assert!(
+            !live.iter().any(|p| p.ends_with("Not continued")),
+            "the live branch was recorded as abandoned: {live:?}"
         );
     }
 }
