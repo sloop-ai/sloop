@@ -133,6 +133,16 @@ fn graft(tree: &mut Tree, parent: NodeId, blocks: Vec<ContentBlock>) -> Result<V
 /// separately is precisely how that goes wrong: an index off by one labels a
 /// node the two branches share, which no later step can detect -- the tree is
 /// still well formed, it just means something else.
+///
+/// The interior fork has a known defect, and this is where it would be fixed.
+/// Sharing a prefix block is free when the block is text, and it is not free
+/// when the block is `thinking`: the shared block's signature was produced in
+/// one generation and the regenerated turn's in another, so the branch replays
+/// to an assistant turn whose reasoning came from two different requests. The
+/// harness README states the constraint in full. The fix belongs here -- fall
+/// back to the root when the shared block would be a `Thinking` block, the way
+/// a one-block turn already does -- and it needs a test, so it is not done
+/// under cover of a comment.
 fn fork_point(root: NodeId, first_branch: &[NodeId]) -> Result<(NodeId, NodeId)> {
     match first_branch {
         [shared, next, ..] => Ok((*shared, *next)),

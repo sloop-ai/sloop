@@ -120,11 +120,32 @@ arrays.
 - cache-hit instrumentation
 - indexing a transcript into `sloop-memory`
 
-One constraint is known and not yet met. Once `tool_use` exists, not every
-block boundary is a legal fork point: an assistant turn ending in a tool call
-requires a matching `tool_result` in the next message, so a fork that
-truncates across the pair produces a request the API rejects. `append` will
-need a validity rule then. Text-only blocks are unaffected.
+Two constraints are known and not yet met, and both say the same thing: not
+every block boundary is a legal fork point.
+
+The first is already here. Forking *inside* a turn keeps that turn's first
+block as a shared prefix, which is free when the block is text and is not free
+when it is `thinking`. The shared block's signature was produced in one
+generation and the regenerated turn's in another, so the branch replays to an
+assistant turn whose reasoning came from two different requests -- and the
+request that produced the second half never contained the first. Today's model
+accepts it; it is the shape preserved thinking rejects, where a signature binds
+the conversation prefix before it. So the tree can currently hold a branch it
+cannot send, which is the one thing its append-only shape exists to prevent.
+The fix is in `fork_point`: fall back to the turn boundary when the shared
+block would be a `Thinking` block, as a one-block turn already does.
+
+The second arrives with tools. An assistant turn ending in a tool call requires
+a matching `tool_result` in the next message, so a fork that truncates across
+the pair produces a request the API rejects. `append` will need a validity rule
+then.
+
+Both were invisible to the tests, and the first was invisible to the design
+that specified it -- the fork example in
+[the tree design](../../docs/plans/2026-09-07-conversation-tree-design.md) was
+worked with text blocks, where sharing a prefix costs nothing. It took reading
+a real transcript to see that the rule stops holding as soon as a block carries
+a signature.
 
 ## Design notes
 
