@@ -6,6 +6,7 @@
 //! comes off in one place once that caller lands.
 #![cfg_attr(not(test), expect(dead_code, reason = "see above"))]
 
+use std::collections::HashSet;
 use std::fmt::Write as _;
 
 use crate::tree::{ContentBlock, NodeId, Role, Tree};
@@ -82,22 +83,97 @@ fn write_group(out: &mut String, tree: &Tree, g: &Group) {
     }
 }
 
-/// Write the branch the session ended on, numbering turns from its user blocks.
+/// Every leaf under `id`, including `id` when it is itself a leaf.
+///
+/// Filtering the global leaf list by ancestry rather than walking the
+/// subtree: the tree is one session, and this keeps traversal in
+/// [`Tree::path`], where the termination argument already lives.
+fn leaves_under(tree: &Tree, id: NodeId) -> Vec<NodeId> {
+    let mut found = Vec::new();
+    for leaf in tree.leaves() {
+        if tree.path(leaf).is_some_and(|p| p.contains(&id)) {
+            found.push(leaf);
+        }
+    }
+    found
+}
+
+/// Render one abandoned branch, quoted, under its own heading.
+///
+/// The heading level is the safety mechanism, not decoration. The chunker
+/// turns headings into a `heading_path` that every retrieval path prints
+/// verbatim, so a level-3 heading here puts `Turn N > Not continued` on the
+/// chunk and no consumer has to remember to say the idea was dropped.
+///
+/// The branch is followed to its own highest-numbered leaf, so a fork inside
+/// a fork still renders as one readable run rather than stopping at the
+/// divergence.
+fn write_aside(out: &mut String, tree: &Tree, head: NodeId) {
+    let Some(tip) = leaves_under(tree, head).last().copied() else {
+        return;
+    };
+    let Some(full) = tree.path(tip) else { return };
+    let Some(start) = full.iter().position(|n| *n == head) else {
+        return;
+    };
+
+    let mut body = String::new();
+    for g in group(tree, &full[start..]) {
+        write_group(&mut body, tree, &g);
+    }
+    if body.trim().is_empty() {
+        return;
+    }
+
+    let _ = writeln!(out, "### Not continued\n");
+    for line in body.trim_end().lines() {
+        // A bare `>` rather than a bare newline: the indexer splits chunks on
+        // blank lines, and a branch quoted across one would be torn in half,
+        // stranding the far side without the heading that disowns it.
+        if line.is_empty() {
+            let _ = writeln!(out, ">");
+        } else {
+            let _ = writeln!(out, "> {line}");
+        }
+    }
+    out.push('\n');
+}
+
+/// Write the branch the session ended on, numbering turns from its user
+/// blocks, and every branch that forked off it as an aside.
 ///
 /// A tree whose spine cannot be walked contributes nothing rather than
 /// aborting the render: the frontmatter and title are already worth indexing.
 fn write_spine(out: &mut String, tree: &Tree) {
     let Some(tip) = spine(tree) else { return };
     let Some(path) = tree.path(tip) else { return };
+    let on_spine: HashSet<NodeId> = path.iter().copied().collect();
 
     let mut turn = 0;
+    // Asides are held back to the end of the turn they forked off. Emitting
+    // one the moment its parent is written would drop a `### Not continued`
+    // between the user block and the reply, splitting the turn it belongs to.
+    let mut asides = String::new();
     for g in group(tree, &path) {
         if g.role == Role::User {
+            out.push_str(&asides);
+            asides.clear();
             turn += 1;
             let _ = writeln!(out, "## Turn {turn}\n");
         }
         write_group(out, tree, &g);
+        for id in &g.ids {
+            let Some(children) = tree.children(*id) else {
+                continue;
+            };
+            for child in children {
+                if !on_spine.contains(child) {
+                    write_aside(&mut asides, tree, *child);
+                }
+            }
+        }
     }
+    out.push_str(&asides);
 }
 
 /// Render the whole tree as one markdown document.
@@ -183,6 +259,142 @@ captured: 2026-09-13
             .unwrap();
         tree.append(
             thinking,
+            Role::Assistant,
+            ContentBlock::text("Expire on write."),
+        )
+        .unwrap();
+
+        assert_eq!(
+            render(&tree, "2026-09-13"),
+            "\
+---
+type: transcript
+captured: 2026-09-13
+---
+
+# How should the cache expire?
+
+## Turn 1
+
+**user:** How should the cache expire?
+
+**assistant:** Expire on write.
+"
+        );
+    }
+
+    #[test]
+    fn a_branch_off_the_spine_renders_as_not_continued() {
+        let mut tree = Tree::new(ContentBlock::text("How should the cache expire?"));
+        let root = tree.root();
+        tree.append(root, Role::Assistant, ContentBlock::text("TTL at 60s."))
+            .unwrap();
+        tree.append(
+            root,
+            Role::Assistant,
+            ContentBlock::text("Expire on write."),
+        )
+        .unwrap();
+
+        assert_eq!(
+            render(&tree, "2026-09-13"),
+            "\
+---
+type: transcript
+captured: 2026-09-13
+---
+
+# How should the cache expire?
+
+## Turn 1
+
+**user:** How should the cache expire?
+
+**assistant:** Expire on write.
+
+### Not continued
+
+> **assistant:** TTL at 60s.
+"
+        );
+    }
+
+    /// The aside has to follow the abandoned branch to its own end.
+    ///
+    /// Stopping at the divergence would quote the rejected proposal without
+    /// the exchange that rejected it, which is the one shape that makes a
+    /// discarded idea read as a standing one.
+    #[test]
+    fn an_abandoned_branch_is_quoted_to_its_own_tip() {
+        let mut tree = Tree::new(ContentBlock::text("How should the cache expire?"));
+        let root = tree.root();
+        let aside = tree
+            .append(root, Role::Assistant, ContentBlock::text("TTL at 60s."))
+            .unwrap();
+        let question = tree
+            .append(
+                aside,
+                Role::User,
+                ContentBlock::text("Does that handle writes?"),
+            )
+            .unwrap();
+        tree.append(
+            question,
+            Role::Assistant,
+            ContentBlock::text("No, stale until expiry."),
+        )
+        .unwrap();
+        tree.append(
+            root,
+            Role::Assistant,
+            ContentBlock::text("Expire on write."),
+        )
+        .unwrap();
+
+        assert_eq!(
+            render(&tree, "2026-09-13"),
+            "\
+---
+type: transcript
+captured: 2026-09-13
+---
+
+# How should the cache expire?
+
+## Turn 1
+
+**user:** How should the cache expire?
+
+**assistant:** Expire on write.
+
+### Not continued
+
+> **assistant:** TTL at 60s.
+>
+> **user:** Does that handle writes?
+>
+> **assistant:** No, stale until expiry.
+"
+        );
+    }
+
+    /// A branch of nothing but thinking must not leave the heading behind.
+    ///
+    /// Thinking is dropped, so such an aside has no body -- and a bare
+    /// `### Not continued` is worse than nothing: it chunks into a section
+    /// that disowns content it does not contain.
+    #[test]
+    fn a_branch_that_renders_to_nothing_gets_no_heading() {
+        let mut tree = Tree::new(ContentBlock::text("How should the cache expire?"));
+        let root = tree.root();
+        tree.append(
+            root,
+            Role::Assistant,
+            ContentBlock::thinking("Weighing LRU against TTL.", "ErUBCkYIBRgCIkA="),
+        )
+        .unwrap();
+        tree.append(
+            root,
             Role::Assistant,
             ContentBlock::text("Expire on write."),
         )

@@ -168,10 +168,6 @@ impl Tree {
     ///
     /// Empty for a leaf. The order is the order the branches were created,
     /// which is what lets a renderer put the spine first.
-    // This crate is a binary, so `pub` reaches no external caller and the
-    // renderer that will read this is not written yet. Drop the attribute
-    // with the first one that calls it.
-    #[cfg_attr(not(test), expect(dead_code, reason = "see above"))]
     #[must_use]
     pub fn children(&self, id: NodeId) -> Option<&[NodeId]> {
         Some(&self.node(id)?.children)
