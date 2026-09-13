@@ -229,6 +229,12 @@ impl Tree {
         leaves
     }
 
+    /// The block this node carries.
+    #[must_use]
+    pub fn block(&self, id: NodeId) -> Option<&ContentBlock> {
+        Some(&self.node(id)?.block)
+    }
+
     /// The label placed on this node, ignoring its ancestors.
     #[must_use]
     pub fn status(&self, id: NodeId) -> Option<Status> {

@@ -60,11 +60,13 @@ async fn main() -> Result<()> {
     let kept = graft(&mut tree, root, first.blocks)?;
 
     // The fork is a *sibling* of the node it hangs off, not a continuation of
-    // it, so the first block of the turn stays a shared prefix and only what
-    // follows differs. `prompt_for` drops the trailing assistant turn either
-    // way, so both branches regenerate from the same user boundary -- the
-    // difference is what the tree remembers, not what the request carries.
-    let (fork_at, kept_divergence) = fork_point(root, &kept)?;
+    // it. Where it hangs is `fork_point`'s decision: inside the turn when the
+    // block that would be shared is text, and at the turn boundary when that
+    // block carries a signature. `prompt_for` drops the trailing assistant
+    // turn either way, so both branches regenerate from the same user boundary
+    // -- the difference is what the tree remembers, not what the request
+    // carries.
+    let (fork_at, kept_divergence) = fork_point(&tree, root, &kept)?;
 
     line("\nfork, abandon, regenerate\n\nturn 1' streaming...")?;
     let second = turn(&api, &tree, fork_at).await?;
@@ -123,10 +125,10 @@ fn graft(tree: &mut Tree, parent: NodeId, blocks: Vec<ContentBlock>) -> Result<V
 /// Where to hang the second branch, and the node of the first branch that
 /// diverges there.
 ///
-/// A turn of two or more blocks has an interior boundary, so the fork goes
+/// A turn of two or more blocks has an interior boundary, so the fork can go
 /// inside it: its first block becomes the shared prefix and its second is
-/// where the two branches part. A one-block turn has no interior boundary, so
-/// the fork falls back to the root and the whole turn is what differs.
+/// where the two branches part. Otherwise the fork falls back to the root and
+/// the whole turn is what differs.
 ///
 /// Both come back from one call because they are one decision. The divergence
 /// is by definition `fork_at`'s child on the first branch, and deriving them
@@ -134,22 +136,37 @@ fn graft(tree: &mut Tree, parent: NodeId, blocks: Vec<ContentBlock>) -> Result<V
 /// node the two branches share, which no later step can detect -- the tree is
 /// still well formed, it just means something else.
 ///
-/// The interior fork has a known defect, and this is where it would be fixed.
-/// Sharing a prefix block is free when the block is text, and it is not free
-/// when the block is `thinking`: the shared block's signature was produced in
-/// one generation and the regenerated turn's in another, so the branch replays
-/// to an assistant turn whose reasoning came from two different requests. The
-/// harness README states the constraint in full. The fix belongs here -- fall
-/// back to the root when the shared block would be a `Thinking` block, the way
-/// a one-block turn already does -- and it needs a test, so it is not done
-/// under cover of a comment.
-fn fork_point(root: NodeId, first_branch: &[NodeId]) -> Result<(NodeId, NodeId)> {
+/// The interior fork is only legal when the shared block carries no signature.
+/// Sharing a prefix block is free when the block is text and is not free when
+/// it is `thinking`: the shared signature was produced by the generation that
+/// also produced the rest of the first branch, so a second generation hung
+/// under it replays to an assistant turn whose reasoning came from two
+/// requests, and the request that produced the second half never contained the
+/// first. Today's model accepts that; preserved thinking is the shape that
+/// rejects it. So a signed shared block takes the same fallback a one-block
+/// turn does, and the tree never holds a branch it cannot send.
+///
+/// Because thinking is on by default on the model this targets, the opening
+/// block of a real turn is usually `thinking` -- which makes the fallback the
+/// common path against the live API and the interior fork the exception.
+fn fork_point(tree: &Tree, root: NodeId, first_branch: &[NodeId]) -> Result<(NodeId, NodeId)> {
     match first_branch {
-        [shared, next, ..] => Ok((*shared, *next)),
-        [only] => Ok((root, *only)),
+        [shared, next, ..] if !signed(tree, *shared)? => Ok((*shared, *next)),
+        [first, ..] => Ok((root, *first)),
         [] => Err(anyhow!(
             "the opening turn came back with no content blocks, so there is nothing to fork"
         )),
+    }
+}
+
+/// Whether this node's block carries a signature bound to the prefix above it.
+///
+/// The question [`fork_point`] asks of a candidate shared block, and the one
+/// place the two block kinds are not interchangeable.
+fn signed(tree: &Tree, id: NodeId) -> Result<bool> {
+    match tree.block(id).ok_or_else(rejected_id)? {
+        ContentBlock::Text { .. } => Ok(false),
+        ContentBlock::Thinking { .. } => Ok(true),
     }
 }
 
@@ -263,7 +280,52 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(fork_point(root, &turn).unwrap(), (turn[0], turn[1]));
+        assert_eq!(fork_point(&tree, root, &turn).unwrap(), (turn[0], turn[1]));
+    }
+
+    // The interior fork shares the turn's first block between both branches.
+    // That is free when the block is text and not free when it is `thinking`:
+    // the shared signature was produced by the generation that also produced
+    // the rest of the first branch, so hanging a second generation under it
+    // replays to an assistant turn whose reasoning came from two requests.
+    // The turn boundary is the only fork point that keeps a signature with
+    // the prefix that produced it.
+    #[test]
+    fn a_turn_opening_on_a_thinking_block_forks_at_the_root() {
+        let mut tree = Tree::new(ContentBlock::text("q"));
+        let root = tree.root();
+        let turn = graft(
+            &mut tree,
+            root,
+            vec![
+                ContentBlock::thinking("weighing both", "sig"),
+                ContentBlock::text("expire on write"),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(fork_point(&tree, root, &turn).unwrap(), (root, turn[0]));
+    }
+
+    // The complement, and the reason the test above is not just "any thinking
+    // block anywhere". Only the *shared* block travels into the second
+    // branch's replay; a signature below the divergence belongs to one branch
+    // alone, and refusing the interior fork for it would give up a legal one.
+    #[test]
+    fn a_thinking_block_below_the_divergence_still_forks_inside_the_turn() {
+        let mut tree = Tree::new(ContentBlock::text("q"));
+        let root = tree.root();
+        let turn = graft(
+            &mut tree,
+            root,
+            vec![
+                ContentBlock::text("shared"),
+                ContentBlock::thinking("weighing both", "sig"),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(fork_point(&tree, root, &turn).unwrap(), (turn[0], turn[1]));
     }
 
     #[test]
@@ -272,13 +334,13 @@ mod tests {
         let root = tree.root();
         let turn = graft(&mut tree, root, vec![ContentBlock::text("only")]).unwrap();
 
-        assert_eq!(fork_point(root, &turn).unwrap(), (root, turn[0]));
+        assert_eq!(fork_point(&tree, root, &turn).unwrap(), (root, turn[0]));
     }
 
     #[test]
     fn a_turn_with_no_blocks_has_nothing_to_fork() {
         let tree = Tree::new(ContentBlock::text("q"));
-        let Err(error) = fork_point(tree.root(), &[]) else {
+        let Err(error) = fork_point(&tree, tree.root(), &[]) else {
             panic!("an empty turn was accepted as a fork point");
         };
 
@@ -297,7 +359,7 @@ mod tests {
         let root = tree.root();
 
         let kept = graft(&mut tree, root, turn).unwrap();
-        let (fork_at, kept_divergence) = fork_point(root, &kept).unwrap();
+        let (fork_at, kept_divergence) = fork_point(&tree, root, &kept).unwrap();
         let abandoned = graft(&mut tree, fork_at, vec![ContentBlock::text("other")]).unwrap();
 
         tree.set_status(kept_divergence, Status::Kept).unwrap();
