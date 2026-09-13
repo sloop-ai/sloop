@@ -98,10 +98,12 @@ why the error message for a missing model names the wrapped binary: a raw
 `sloop-harness` now holds a conversation tree and a client that fills it.
 Nodes are content blocks carrying a kept / abandoned / pending label, a branch
 replays to a `messages[]` array, and `api` streams a turn back from
-`/v1/messages` as blocks the tree appends. Its README covers both. Still
-unbuilt: `tool_use` and `tool_result` and the fork-validity rule they need,
-retries, cache-hit instrumentation, and indexing a transcript back into
-`sloop-memory`.
+`/v1/messages` as blocks the tree appends. Its README covers both. It also writes each session
+as markdown into the `transcripts` root, which closes the memory loop: the
+daemon's watcher indexes that file like any other note, so the harness never
+touches the index and the two cannot race on the same rows. Still unbuilt:
+`tool_use` and `tool_result` and the fork-validity rule they need, retries,
+cache-hit instrumentation, usage feedback, and the wikilink graph.
 
 The client has its own internal seam, and it exists for the same reason the
 library/binary split does. Everything except the single socket call is a pure

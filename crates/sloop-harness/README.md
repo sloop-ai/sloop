@@ -111,14 +111,34 @@ before any request is built.
 
 sends the opening turn, forks at a block boundary, regenerates the forked turn,
 labels one branch kept and the other abandoned, and prints both as `messages[]`
-arrays.
+arrays. It also writes the session to the `transcripts` root after each turn,
+if one is configured, and says so if none is.
+
+## What the label is for now
+
+`Status` marks which branch is live for the harness's own use. The indexer does
+not read it, and the slice that closed the memory loop is the reason why.
+
+Feeding a transcript back was supposed to depend on it: a labelled rejection
+staying distinguishable from a conclusion. It does not work. A label is
+metadata and the text is what gets read, so every consumer has to remember to
+join them -- and the lattice makes it worse, since `Abandoned` dominates
+`Kept`, marking a fact established on the way to a wrong conclusion as
+discarded along with it.
+
+What carries the distinction instead is a heading. A branch that was dropped
+renders under `### Not continued`, which the chunker turns into `heading_path`,
+which travels into both the injected pointer and the embedded chunk text. No
+filter, no column, and nothing to forget.
+[The design doc](../../docs/plans/2026-09-13-transcript-indexing-design.md)
+records the whole argument.
 
 ## Not built yet
 
 - `tool_use` and `tool_result`, and the fork-validity rule they need
 - retries and backoff
 - cache-hit instrumentation
-- indexing a transcript into `sloop-memory`
+- usage feedback, and lighting up the wikilink graph in retrieval
 
 Not every block boundary is a legal fork point. Two constraints say so; one is
 met and the other is not.
