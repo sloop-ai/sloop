@@ -5,16 +5,6 @@ use std::fmt::Write as _;
 
 use crate::tree::{ContentBlock, NodeId, Role, Tree};
 
-/// The branch the session ended on.
-///
-/// `leaves` enumerates the arena, so it comes back in ascending creation
-/// order and the last entry is the highest `NodeId`. A node is always
-/// appended after its parent and never reparented, so that leaf is the one
-/// most recently extended -- the branch that was live when the run stopped.
-fn spine(tree: &Tree) -> Option<NodeId> {
-    tree.leaves().last().copied()
-}
-
 /// The block's text, or `None` for a kind that is not written down.
 ///
 /// Thinking blocks are deliberately dropped. They run several times the
@@ -136,14 +126,11 @@ fn write_aside(out: &mut String, tree: &Tree, head: NodeId) {
     out.push('\n');
 }
 
-/// Write the branch the session ended on, numbering turns from its user
-/// blocks, and every branch that forked off it as an aside.
+/// Write the live branch, numbering turns from its user blocks, and every
+/// branch that forked off it as an aside.
 ///
-/// A tree whose spine cannot be walked contributes nothing rather than
-/// aborting the render: the frontmatter and title are already worth indexing.
-fn write_spine(out: &mut String, tree: &Tree) {
-    let Some(tip) = spine(tree) else { return };
-    let Some(path) = tree.path(tip) else { return };
+/// `path` is the spine, root first, as the caller's tip resolves it.
+fn write_spine(out: &mut String, tree: &Tree, path: &[NodeId]) {
     let on_spine: HashSet<NodeId> = path.iter().copied().collect();
 
     let mut turn = 0;
@@ -151,7 +138,7 @@ fn write_spine(out: &mut String, tree: &Tree) {
     // one the moment its parent is written would drop a `### Not continued`
     // between the user block and the reply, splitting the turn it belongs to.
     let mut asides = String::new();
-    for g in group(tree, &path) {
+    for g in group(tree, path) {
         if g.role == Role::User {
             out.push_str(&asides);
             asides.clear();
@@ -234,19 +221,37 @@ pub fn filename(tree: &Tree, captured: &str) -> String {
 /// The H1 is a heading rather than the note's title: the indexer takes the
 /// title from the filename stem, and headings become the `heading_path` that
 /// every chunk carries.
+///
+/// `tip` is the live branch, and it is an argument because the renderer cannot
+/// work it out. Recency does not answer it: the harness forks and regenerates,
+/// so the branch it threw away is the one holding the highest node ids, and any
+/// rule reading "newest" off the arena names the wrong side of every fork. The
+/// caller grafted the branches and is the only party that knows which one it
+/// kept.
+///
+/// A `tip` that is not a leaf is a legal thing to ask for and means what it
+/// says: the spine ends there, and whatever hangs below it renders as an aside
+/// like any other branch that was not continued.
+///
+/// A `tip` that is not a node of this tree returns `None`, matching what
+/// [`Tree`] does with a foreign [`NodeId`] everywhere else. Rendering some
+/// other branch instead would produce a document that looks right and records
+/// the wrong conversation, which is exactly the failure this argument exists to
+/// remove.
 #[must_use]
-pub fn render(tree: &Tree, captured: &str) -> String {
+pub fn render(tree: &Tree, tip: NodeId, captured: &str) -> Option<String> {
+    let path = tree.path(tip)?;
     let mut out = String::new();
     let _ = writeln!(out, "---\ntype: transcript\ncaptured: {captured}\n---\n");
     let _ = writeln!(out, "# {}\n", title_of(tree));
-    write_spine(&mut out, tree);
+    write_spine(&mut out, tree, &path);
 
     // Every paragraph is written with a blank line after it, so the last one
     // leaves the document ending in a blank. The indexer splits on blank
     // lines, and a trailing one is an empty chunk.
     out.truncate(out.trim_end().len());
     out.push('\n');
-    out
+    Some(out)
 }
 
 #[cfg(test)]
@@ -337,11 +342,12 @@ mod tests {
                 ContentBlock::text("Expire on write."),
             )
             .unwrap();
-        tree.append(reply, Role::User, ContentBlock::text("Why not TTL?"))
+        let tip = tree
+            .append(reply, Role::User, ContentBlock::text("Why not TTL?"))
             .unwrap();
 
         assert_eq!(
-            render(&tree, "2026-09-13"),
+            render(&tree, tip, "2026-09-13").unwrap(),
             "\
 ---
 type: transcript
@@ -377,47 +383,16 @@ captured: 2026-09-13
                 ContentBlock::thinking("Weighing LRU against TTL.", "ErUBCkYIBRgCIkA="),
             )
             .unwrap();
-        tree.append(
-            thinking,
-            Role::Assistant,
-            ContentBlock::text("Expire on write."),
-        )
-        .unwrap();
-
-        assert_eq!(
-            render(&tree, "2026-09-13"),
-            "\
----
-type: transcript
-captured: 2026-09-13
----
-
-# How should the cache expire?
-
-## Turn 1
-
-**user:** How should the cache expire?
-
-**assistant:** Expire on write.
-"
-        );
-    }
-
-    #[test]
-    fn a_branch_off_the_spine_renders_as_not_continued() {
-        let mut tree = Tree::new(ContentBlock::text("How should the cache expire?"));
-        let root = tree.root();
-        tree.append(root, Role::Assistant, ContentBlock::text("TTL at 60s."))
+        let tip = tree
+            .append(
+                thinking,
+                Role::Assistant,
+                ContentBlock::text("Expire on write."),
+            )
             .unwrap();
-        tree.append(
-            root,
-            Role::Assistant,
-            ContentBlock::text("Expire on write."),
-        )
-        .unwrap();
 
         assert_eq!(
-            render(&tree, "2026-09-13"),
+            render(&tree, tip, "2026-09-13").unwrap(),
             "\
 ---
 type: transcript
@@ -431,10 +406,6 @@ captured: 2026-09-13
 **user:** How should the cache expire?
 
 **assistant:** Expire on write.
-
-### Not continued
-
-> **assistant:** TTL at 60s.
 "
         );
     }
@@ -464,15 +435,16 @@ captured: 2026-09-13
             ContentBlock::text("No, stale until expiry."),
         )
         .unwrap();
-        tree.append(
-            root,
-            Role::Assistant,
-            ContentBlock::text("Expire on write."),
-        )
-        .unwrap();
+        let tip = tree
+            .append(
+                root,
+                Role::Assistant,
+                ContentBlock::text("Expire on write."),
+            )
+            .unwrap();
 
         assert_eq!(
-            render(&tree, "2026-09-13"),
+            render(&tree, tip, "2026-09-13").unwrap(),
             "\
 ---
 type: transcript
@@ -498,6 +470,113 @@ captured: 2026-09-13
         );
     }
 
+    /// The tree `main` actually builds, in the order it builds it.
+    ///
+    /// The kept turn is grafted first and the fork hangs the regenerated turn
+    /// off it afterwards, so the abandoned branch always holds the higher node
+    /// ids. Any spine picked by recency therefore picks the branch that was
+    /// thrown away, and the whole document comes out inverted: the rejected
+    /// answer in the turn body, the kept one disowned under `Not continued`.
+    /// The assertion is the whole document because the defect is which side of
+    /// that heading each answer lands on.
+    ///
+    /// This replaces an earlier test that grafted the abandoned branch first,
+    /// which passed under a recency rule and under this one alike.
+    #[test]
+    fn the_kept_branch_is_the_spine_even_though_the_fork_is_newer() {
+        let mut tree = Tree::new(ContentBlock::text("How should the cache expire?"));
+        let root = tree.root();
+        let kept = tree
+            .append(
+                root,
+                Role::Assistant,
+                ContentBlock::text("Expire on write."),
+            )
+            .unwrap();
+        tree.append(root, Role::Assistant, ContentBlock::text("TTL at 60s."))
+            .unwrap();
+
+        assert_eq!(
+            render(&tree, kept, "2026-09-13").unwrap(),
+            "\
+---
+type: transcript
+captured: 2026-09-13
+---
+
+# How should the cache expire?
+
+## Turn 1
+
+**user:** How should the cache expire?
+
+**assistant:** Expire on write.
+
+### Not continued
+
+> **assistant:** TTL at 60s.
+"
+        );
+    }
+
+    /// An interior tip ends the spine where the caller says it does, and the
+    /// continuation below it is a branch that was not continued like any
+    /// other. Nothing is dropped, and nothing is silently promoted back onto
+    /// the spine.
+    #[test]
+    fn a_tip_that_is_not_a_leaf_ends_the_spine_there() {
+        let mut tree = Tree::new(ContentBlock::text("How should the cache expire?"));
+        let root = tree.root();
+        let reply = tree
+            .append(
+                root,
+                Role::Assistant,
+                ContentBlock::text("Expire on write."),
+            )
+            .unwrap();
+        tree.append(reply, Role::User, ContentBlock::text("Why not TTL?"))
+            .unwrap();
+
+        assert_eq!(
+            render(&tree, reply, "2026-09-13").unwrap(),
+            "\
+---
+type: transcript
+captured: 2026-09-13
+---
+
+# How should the cache expire?
+
+## Turn 1
+
+**user:** How should the cache expire?
+
+**assistant:** Expire on write.
+
+### Not continued
+
+> **user:** Why not TTL?
+"
+        );
+    }
+
+    /// A tip from another tree renders nothing at all.
+    ///
+    /// The alternative -- falling back to some branch of this tree -- is the
+    /// defect this argument was added to remove: a document that reads as a
+    /// faithful transcript while recording a conversation nobody had.
+    #[test]
+    fn a_tip_this_tree_never_minted_renders_nothing() {
+        let mut other = Tree::new(ContentBlock::text("A different session."));
+        let root = other.root();
+        let foreign = other
+            .append(root, Role::Assistant, ContentBlock::text("A reply."))
+            .unwrap();
+        let tree = Tree::new(ContentBlock::text("How should the cache expire?"));
+
+        assert_eq!(render(&tree, foreign, "2026-09-13"), None);
+    }
+
     /// A branch of nothing but thinking must not leave the heading behind.
     ///
     /// Thinking is dropped, so such an aside has no body -- and a bare
@@ -513,15 +592,16 @@ captured: 2026-09-13
             ContentBlock::thinking("Weighing LRU against TTL.", "ErUBCkYIBRgCIkA="),
         )
         .unwrap();
-        tree.append(
-            root,
-            Role::Assistant,
-            ContentBlock::text("Expire on write."),
-        )
-        .unwrap();
+        let tip = tree
+            .append(
+                root,
+                Role::Assistant,
+                ContentBlock::text("Expire on write."),
+            )
+            .unwrap();
 
         assert_eq!(
-            render(&tree, "2026-09-13"),
+            render(&tree, tip, "2026-09-13").unwrap(),
             "\
 ---
 type: transcript

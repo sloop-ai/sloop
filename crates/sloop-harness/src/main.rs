@@ -68,10 +68,16 @@ fn transcript_dir(roots: &[(&str, &Path)]) -> Result<PathBuf, String> {
 /// unchanged rewrite free. The daemon's watcher picks it up after
 /// `WATCH_DEBOUNCE_SECS` -- the harness never touches the index itself, which
 /// is what keeps the two from racing on the same rows.
-fn record(dir: &Path, tree: &Tree) -> Result<PathBuf> {
+///
+/// `tip` is the live branch, and it has to be passed because the renderer
+/// cannot work it out -- see [`transcript::render`]. A tip this tree never
+/// minted is a caller bug, not a reason to write some other branch out as the
+/// conversation, so it fails the write rather than recording a plausible lie.
+fn record(dir: &Path, tree: &Tree, tip: NodeId) -> Result<PathBuf> {
     let captured = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let rendered = transcript::render(tree, tip, &captured).ok_or_else(rejected_id)?;
     let path = dir.join(transcript::filename(tree, &captured));
-    std::fs::write(&path, transcript::render(tree, &captured))
+    std::fs::write(&path, rendered)
         .with_context(|| format!("writing the session transcript to {}", path.display()))?;
     Ok(path)
 }
@@ -119,8 +125,18 @@ async fn main() -> Result<()> {
     line("\nturn 1  streaming...")?;
     let first = turn(&api, &tree, root).await?;
     let kept = graft(&mut tree, root, first.blocks)?;
+
+    // The live branch, named once and passed to every write below. It stays
+    // the kept branch after the fork exists: the second `graft` gives the
+    // abandoned branch the higher node ids, so anything the renderer could
+    // infer from the arena would name the branch this run is throwing away.
+    //
+    // A turn that came back with no blocks leaves the root as the only node on
+    // the branch, and the root is then the tip. `fork_point` rejects that turn
+    // a few lines below, but the first `record` happens before it does.
+    let live = kept.last().copied().unwrap_or(root);
     if let Ok(dir) = &dir {
-        line(&format!("recorded {}", record(dir, &tree)?.display()))?;
+        line(&format!("recorded {}", record(dir, &tree, live)?.display()))?;
     }
 
     // The fork is a *sibling* of the node it hangs off, not a continuation of
@@ -136,7 +152,7 @@ async fn main() -> Result<()> {
     let second = turn(&api, &tree, fork_at).await?;
     let abandoned = graft(&mut tree, fork_at, second.blocks)?;
     if let Ok(dir) = &dir {
-        line(&format!("recorded {}", record(dir, &tree)?.display()))?;
+        line(&format!("recorded {}", record(dir, &tree, live)?.display()))?;
     }
     let [abandoned_divergence, ..] = abandoned.as_slice() else {
         return Err(anyhow!(
@@ -356,7 +372,7 @@ mod tests {
         let tree = Tree::new(ContentBlock::text("How should the cache expire?"));
         let captured = chrono::Local::now().format("%Y-%m-%d").to_string();
 
-        let path = record(dir.path(), &tree).unwrap();
+        let path = record(dir.path(), &tree, tree.root()).unwrap();
 
         assert_eq!(
             path,
@@ -365,8 +381,30 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
-            transcript::render(&tree, &captured)
+            transcript::render(&tree, tree.root(), &captured).unwrap()
         );
+    }
+
+    /// `record` writes nothing when the tip is foreign to the tree.
+    ///
+    /// The kept branch is `main`'s to name; a tip that names a node of some
+    /// other tree is a bug in that bookkeeping, and the only wrong answer is a
+    /// file on disk that the daemon indexes as this session's conversation.
+    #[test]
+    fn a_tip_from_another_tree_records_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut other = Tree::new(ContentBlock::text("A different session."));
+        let other_root = other.root();
+        let foreign = graft(&mut other, other_root, vec![ContentBlock::text("x")]).unwrap()[0];
+        let tree = Tree::new(ContentBlock::text("How should the cache expire?"));
+
+        let error = record(dir.path(), &tree, foreign).unwrap_err();
+
+        assert!(
+            error.to_string().contains("rejected by the tree"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     #[test]

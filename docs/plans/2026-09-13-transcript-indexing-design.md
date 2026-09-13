@@ -134,11 +134,18 @@ from the opening user block, and is a heading rather than the title. Turns
 become H2s, so every chunk gets a populated `heading_path` rather than an
 empty one.
 
-**The spine is the leaf with the highest `NodeId`.** Nodes are appended in
-creation order and never reparented -- the argument `path()` uses to prove it
-terminates -- so the highest-numbered leaf is exactly the branch the session
-was on when it ended. Every fork off the spine renders in place as a
-`### Not continued` subsection, quoted.
+**The spine is an argument to `render`, not something it infers.** The caller
+grafted the branches and is the only party that knows which one is live. A
+recency rule -- the leaf with the highest `NodeId` -- was tried and is wrong
+for the one caller there is: the harness grafts the kept turn, then forks and
+grafts the turn it is abandoning, so the discarded branch always holds the
+higher ids and "newest" names exactly the wrong side of every fork. Every fork
+off the spine renders in place as a `### Not continued` subsection, quoted.
+
+A tip that is not a leaf ends the spine there and renders what hangs below it
+as an aside. A tip the tree never minted renders nothing, rather than falling
+back to a branch that would read as a faithful transcript of the wrong
+conversation.
 
 The alternative, rendering every branch as a peer section, was rejected.
 Branches share prefixes in the tree and a flat render does not, so it must
@@ -195,7 +202,8 @@ hits above threshold. Deterministic, and no ranking model.
 ## Testing
 
 Rendering, in `sloop-harness`: hand-built trees to expected markdown, covering
-a fork, a single-branch session, and the spine rule with more than two leaves.
+a fork built in the order the harness builds it, a single-branch session, an
+interior tip, and a tip from another tree.
 
 Chunkability, in `chunk.rs` where the code under test lives: a transcript
 fixture through `parse_note`, asserting `heading_path`, `captured` and
