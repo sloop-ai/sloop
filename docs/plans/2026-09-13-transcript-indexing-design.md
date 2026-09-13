@@ -124,8 +124,9 @@ wikilink graph, and any LLM in the ingestion path. Those are named at the end.
 
 Frontmatter supplies `captured` and `note_type` -- the YAML key is `type`,
 which `parse_frontmatter` reads into `Frontmatter::note_type`. The H1 comes
-from the opening user block, and is a heading rather than the title. Turns become H2s, so every chunk gets a populated `heading_path`
-rather than an empty one.
+from the opening user block, and is a heading rather than the title. Turns
+become H2s, so every chunk gets a populated `heading_path` rather than an
+empty one.
 
 **The spine is the leaf with the highest `NodeId`.** Nodes are appended in
 creation order and never reparented -- the argument `path()` uses to prove it
