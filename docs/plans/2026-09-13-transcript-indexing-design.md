@@ -86,6 +86,12 @@ continued" is inside the string that gets embedded and full-text indexed, and
 inside the `Hit.text` the MCP tool renders. Both retrieval paths carry the
 frame, and neither needs a filter to do it.
 
+The frame also survives chunk splitting, which was not obvious and was
+verified against the real chunker rather than reasoned about: `parse_note`
+keys `heading_path` per *section*, not per chunk, so an abandoned branch long
+enough to be split across several chunks carries "Not continued" on every one
+of them. The mechanism does not depend on a branch fitting in one chunk.
+
 `title` there is the **filename stem** rather than the H1 (`index.rs:196`), so
 it appears in every chunk header of the file. Transcript filenames must
 therefore be descriptive: `2026-09-13-how-should-the-cache-expire.md`, not a

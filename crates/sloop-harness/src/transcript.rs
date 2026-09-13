@@ -127,9 +127,12 @@ fn write_aside(out: &mut String, tree: &Tree, head: NodeId) {
 
     let _ = writeln!(out, "### Not continued\n");
     for line in body.trim_end().lines() {
-        // A bare `>` rather than a bare newline: the indexer splits chunks on
-        // blank lines, and a branch quoted across one would be torn in half,
-        // stranding the far side without the heading that disowns it.
+        // A bare `>` rather than a bare newline, so the branch stays one
+        // blockquote instead of several. Not for the heading's sake: the
+        // indexer keys heading_path per *section*, so a branch long enough to
+        // split across chunks says "Not continued" on every one of them. This
+        // is about the branch reading as one passage when a pointer is
+        // followed into it.
         if line.is_empty() {
             let _ = writeln!(out, ">");
         } else {
