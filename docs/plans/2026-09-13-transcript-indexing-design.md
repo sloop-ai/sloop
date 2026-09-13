@@ -80,6 +80,17 @@ already prints heading paths. It cannot drift from its content, because it is
 a heading over that content. It costs no column, no filter and no schema
 change.
 
+It reaches further than the pointer. `parse_note` prepends a context header to
+the text it embeds -- `"{title} > {heading_path}\n\n{piece}"` -- so "Not
+continued" is inside the string that gets embedded and full-text indexed, and
+inside the `Hit.text` the MCP tool renders. Both retrieval paths carry the
+frame, and neither needs a filter to do it.
+
+`title` there is the **filename stem** rather than the H1 (`index.rs:196`), so
+it appears in every chunk header of the file. Transcript filenames must
+therefore be descriptive: `2026-09-13-how-should-the-cache-expire.md`, not a
+session id.
+
 ## What is being built
 
 1. A `Tree` to markdown renderer in `sloop-harness`.
@@ -93,7 +104,7 @@ wikilink graph, and any LLM in the ingestion path. Those are named at the end.
 ## Rendering
 
     ---
-    note_type: transcript
+    type: transcript
     captured: 2026-09-13
     ---
 
@@ -111,8 +122,9 @@ wikilink graph, and any LLM in the ingestion path. Those are named at the end.
     > TTL-only expiry at 60s. Simple, but every read after expiry
     > blocks while it revalidates.
 
-Frontmatter supplies `captured` and `note_type`. The H1 comes from the opening
-user block. Turns become H2s, so every chunk gets a populated `heading_path`
+Frontmatter supplies `captured` and `note_type` -- the YAML key is `type`,
+which `parse_frontmatter` reads into `Frontmatter::note_type`. The H1 comes
+from the opening user block, and is a heading rather than the title. Turns become H2s, so every chunk gets a populated `heading_path`
 rather than an empty one.
 
 **The spine is the leaf with the highest `NodeId`.** Nodes are appended in
