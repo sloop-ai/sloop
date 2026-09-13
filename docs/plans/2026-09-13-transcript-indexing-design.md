@@ -238,10 +238,36 @@ for: what gets retrieved changes what gets retrieved next.
 
 **The wikilink graph.** `chunk::extract_wikilinks` already pulls every
 `[[link]]` into an `entities` column, and `store.rs:236` builds a LabelList
-index on it. Nothing reads it. That is a hand-authored concept graph, already
-extracted and already indexed, wired to nothing. One hop of traversal, no LLM.
-Transcripts contain no wikilinks, so they enter that graph as isolated nodes
-and rank below well-linked notes structurally rather than by a hardcoded cap.
+index on it. Nothing reads it: already extracted, already indexed, wired to
+nothing. One hop of traversal, no LLM.
+
+The claim that this is a *hand-authored concept graph* was an assumption, and
+counting the configured roots on 2026-09-13 disproved it:
+
+| root | files | `[[link]]`s | files linking | distinct targets |
+| --- | --- | --- | --- | --- |
+| `loomis` (Obsidian) | 89 | 0 | 0 | 0 |
+| `oro` (Obsidian) | 9 | 11 | 1 | 7 |
+| `memory` (agent-written) | 95 | 84 | 65 | 59 |
+
+The hand-authored half of the corpus is not linked at all: 11 links across 98
+files, every one of them in a single file. Nearly every link that exists was
+written by an agent into `memory`, and 26 of those 59 targets resolve to no
+file -- `[[name]]` is written as a note-to-self before the note exists, which
+the memory instructions explicitly encourage.
+
+So the traversal premise fails in both directions. 127 of 193 files are
+isolated nodes, which means one hop from a hit usually reaches nothing; and
+transcripts entering as isolated nodes would *not* thereby rank below
+well-linked notes, because most notes are equally isolated. There is no
+structural signal to inherit.
+
+That reorders the two slices. Generating edges is no longer the speculative
+follow-on to traversing them -- it is the precondition, and the only one of
+the two with a measurable win available. Traversal over 0.49 links per file
+is not worth building first. Before either, re-run the count: the number that
+matters is links per file in the roots actually configured, and it is cheap
+enough that no slice here should rest on a guess about it again.
 
 **An async concept graph.** A graph rather than a hierarchy: a hierarchy forces
 each chunk into one parent, and concepts belong to many. A graph also degrades
