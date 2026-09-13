@@ -120,25 +120,32 @@ arrays.
 - cache-hit instrumentation
 - indexing a transcript into `sloop-memory`
 
-Two constraints are known and not yet met, and both say the same thing: not
-every block boundary is a legal fork point.
+Not every block boundary is a legal fork point. Two constraints say so; one is
+met and the other is not.
 
-The first is already here. Forking *inside* a turn keeps that turn's first
-block as a shared prefix, which is free when the block is text and is not free
-when it is `thinking`. The shared block's signature was produced in one
-generation and the regenerated turn's in another, so the branch replays to an
-assistant turn whose reasoning came from two different requests -- and the
-request that produced the second half never contained the first. Today's model
-accepts it; it is the shape preserved thinking rejects, where a signature binds
-the conversation prefix before it. So the tree can currently hold a branch it
-cannot send, which is the one thing its append-only shape exists to prevent.
-The fix is in `fork_point`: fall back to the turn boundary when the shared
-block would be a `Thinking` block, as a one-block turn already does.
+The met one is about signatures. Forking *inside* a turn keeps that turn's
+first block as a shared prefix, which is free when the block is text and is not
+free when it is `thinking`. The shared signature was produced by the generation
+that also produced the rest of the first branch, so a second generation hung
+under it replays to an assistant turn whose reasoning came from two different
+requests -- and the request that produced the second half never contained the
+first. Today's model accepts it; it is the shape preserved thinking rejects,
+where a signature binds the conversation prefix before it. So the tree would
+have held a branch it cannot send, which is the one thing its append-only shape
+exists to prevent. `fork_point` now falls back to the turn boundary when the
+shared block would carry a signature, the way a one-block turn already did.
 
-The second arrives with tools. An assistant turn ending in a tool call requires
-a matching `tool_result` in the next message, so a fork that truncates across
-the pair produces a request the API rejects. `append` will need a validity rule
-then.
+That fallback is the common case rather than a corner. Thinking is on by
+default, so the opening block of a real turn is usually `thinking`, and against
+the live API the demo now forks at the turn boundary far more often than inside
+the turn. Only the *shared* block is consulted: a signature below the
+divergence belongs to one branch alone, and refusing the interior fork for it
+would give up a legal one.
+
+The unmet one arrives with tools. An assistant turn ending in a tool call
+requires a matching `tool_result` in the next message, so a fork that truncates
+across the pair produces a request the API rejects. `append` will need a
+validity rule then.
 
 Both were invisible to the tests, and the first was invisible to the design
 that specified it -- the fork example in

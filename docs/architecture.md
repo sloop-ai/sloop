@@ -121,7 +121,10 @@ blocks whether or not the caller asked -- which is why `ContentBlock` has that
 variant while `tool_use` can wait. A thinking block's signature binds the
 conversation prefix that produced it and has to travel back byte-identical,
 which the tree gets for free: it only ever appends, and a fork truncates the
-tail rather than rewriting history.
+tail rather than rewriting history. What is not free is *where* a fork
+truncates -- sharing a signed block across two generations gives one turn
+reasoning from two requests -- so the harness forks at the turn boundary
+whenever the block it would share carries a signature.
 
 The harness still reaches only for `config` and `index`. The tree itself needs
 nothing from the engine at all, which is the expected shape -- the link exists
