@@ -8,16 +8,6 @@
 //! `str::lines`, which counts `\r\n` as one ending and strips the `\r`, so a
 //! `data:` value ending in a carriage return does not come back out intact.
 
-// Nothing outside the tests calls any of this until `Api::send` has a socket
-// to read from. `pub` exempts nothing in a binary crate, so the whole module
-// needs the label, and it goes once that caller exists. The not(test) guard
-// records which build the label is about -- under cfg(test) the tests reach
-// every item, so none of it is dead there. It is documentation rather than a
-// tripwire: rustc does not report an unfulfilled `dead_code` expectation, so
-// an unconditional attribute would sit just as quiet over a module that had
-// stopped being dead.
-#![cfg_attr(not(test), expect(dead_code, reason = "see above"))]
-
 use anyhow::{ensure, Context, Result};
 use serde::Deserialize;
 

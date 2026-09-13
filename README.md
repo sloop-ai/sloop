@@ -34,7 +34,10 @@ index, rather than turning every rejected idea into a retrievable fact.
 
 It holds a conversation tree today: nodes are content blocks, each carries a
 kept / abandoned / pending label, and any branch replays to a `messages[]`
-array. What it does not yet have is the client that would send one.
+array. It now sends one too -- a streaming client decodes a turn back into
+blocks the tree accepts, so a branch can be forked at a block boundary and
+regenerated against the live API. What it does not yet do is feed any of that
+back into the index, which is the half that closes the loop.
 
 ## The parts
 
@@ -42,7 +45,7 @@ array. What it does not yet have is the client that would send one.
 |---|---|
 | [`sloop-memory-core`](crates/sloop-memory-core) | Library. Chunking, embedding, index building, hybrid retrieval, and the daemon's socket protocol. |
 | [`sloop-memory`](crates/sloop-memory) | Binary. A resident daemon with a filesystem watcher, an MCP server, a CLI, and a Claude Code prompt hook. |
-| [`sloop-harness`](crates/sloop-harness) | Binary. A branching agent harness over the Anthropic Messages API. Has the conversation tree; no client yet. |
+| [`sloop-harness`](crates/sloop-harness) | Binary. A branching agent harness over the Anthropic Messages API. Holds the conversation tree and streams turns into it; no tools, and nothing indexed back yet. |
 
 The library/binary split exists so a consumer can link the engine directly and
 call it in-process instead of standing up a daemon and talking to it over a Unix

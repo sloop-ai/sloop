@@ -5,12 +5,6 @@
 //! lives, so `send` stays a loop that hands events over and forwards whatever
 //! comes back.
 
-// Only the tests drive this until `Api::send` has a socket to read from; the
-// attribute and this note go with that commit. Guarded on not(test) for the
-// same reason as `sse.rs`: under cfg(test) every item here is reached, so an
-// unconditional expectation would be about a build where it does not hold.
-#![cfg_attr(not(test), expect(dead_code, reason = "see above"))]
-
 use std::collections::BTreeMap;
 
 use anyhow::{bail, Result};
