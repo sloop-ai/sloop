@@ -157,37 +157,42 @@ const MEMORY_PREAMBLE: &str = "Relevant recorded-fact pointers -- about this mac
     sloop_search for the same query. The note is the source; there is nothing else to \
     check it against.\n";
 
+/// The root `sloop-harness` writes rendered sessions into. Like `MEMORY_LABEL`,
+/// the label is the whole signal: rename the root and this constant follows.
+const TRANSCRIPT_LABEL: &str = "transcripts";
+
+/// Framing for pointers from the `transcripts` root: a record of working
+/// something out, not a conclusion about it. Nothing in a transcript was chosen
+/// to be written down, and a `Not continued` heading marks a branch the session
+/// abandoned -- so this says to read *around* the hit, because the surrounding
+/// turns are the only thing that says which kind of text was matched.
+const TRANSCRIPT_PREAMBLE: &str = "Relevant session transcript pointers -- a record of a \
+    conversation, not its conclusions. Read the exact file path; do not call sloop_search for \
+    the same query. Read around the hit; the surrounding turns are what give it meaning. A \
+    `Not continued` heading marks an approach the session tried and dropped -- not a finding.\n";
+
 /// Renders the block injected before the user's prompt. Pointers are grouped by
 /// root so each group gets the framing suited to what that root actually is --
-/// see `MEMORY_LABEL`, `NOTES_PREAMBLE`, and `MEMORY_PREAMBLE`.
+/// see `MEMORY_LABEL`, `TRANSCRIPT_LABEL`, and the three preamble constants.
 fn render_pointer_block(pointers: &[proto::Pointer]) -> String {
-    let mut memory = Vec::new();
-    let mut notes = Vec::new();
+    // A group is created where its first pointer appears, so a single-root call
+    // has one obvious rendering rather than a fixed but arbitrary group order,
+    // and an absent root contributes no group at all.
+    let mut groups: Vec<(&str, Vec<&proto::Pointer>)> = Vec::new();
     for p in pointers {
-        if p.source_type == MEMORY_LABEL {
-            memory.push(p);
-        } else {
-            notes.push(p);
+        let preamble = match p.source_type.as_str() {
+            MEMORY_LABEL => MEMORY_PREAMBLE,
+            TRANSCRIPT_LABEL => TRANSCRIPT_PREAMBLE,
+            _ => NOTES_PREAMBLE,
+        };
+        match groups.iter_mut().find(|(seen, _)| *seen == preamble) {
+            Some((_, group)) => group.push(p),
+            None => groups.push((preamble, vec![p])),
         }
     }
 
-    // Render whichever group appeared first in the input first, so a
-    // single-root call has one obvious rendering rather than a fixed but
-    // arbitrary group order.
-    let memory_first = pointers
-        .first()
-        .is_some_and(|p| p.source_type == MEMORY_LABEL);
-    let groups: [(&str, &[&proto::Pointer]); 2] = if memory_first {
-        [(MEMORY_PREAMBLE, &memory), (NOTES_PREAMBLE, &notes)]
-    } else {
-        [(NOTES_PREAMBLE, &notes), (MEMORY_PREAMBLE, &memory)]
-    };
-
     let mut out = String::from("<sloop-recall>\n");
     for (preamble, group) in groups {
-        if group.is_empty() {
-            continue;
-        }
         out.push_str(preamble);
         for p in group {
             append_pointer_line(&mut out, p);
@@ -406,7 +411,7 @@ fn print_index_stats(stats: &index::IndexStats, via: &str) {
 mod tests {
     use super::{
         is_non_user_envelope, print_status, render_pointer_block, status_exit, MEMORY_PREAMBLE,
-        NOTES_PREAMBLE,
+        NOTES_PREAMBLE, TRANSCRIPT_PREAMBLE,
     };
     use sloop_memory_core::proto::Pointer;
     use sloop_memory_core::store::RootCount;
@@ -422,6 +427,15 @@ mod tests {
             captured: "2026-08-01".to_string(),
             cosine: 0.42,
         }
+    }
+
+    /// The line `pointer` above renders to, so a whole-block assertion can name
+    /// which pointer it expects where without restating the line format.
+    fn line(source_type: &str, title: &str) -> String {
+        format!(
+            "  {title}.md > Some Heading  (source {source_type}, cos 0.42, \
+             captured 2026-08-01)\n"
+        )
     }
 
     /// Framing must key off the root label, not what's in the note -- two
@@ -446,24 +460,99 @@ mod tests {
         assert!(notes_section.contains("live source"));
     }
 
-    /// A single root must render exactly one group -- no empty second
-    /// preamble, no stray separator left over from the other branch.
+    /// A single root must render exactly one group -- no empty preamble for a
+    /// root that contributed nothing, no stray separator from another branch.
     #[test]
     fn single_root_renders_one_group() {
         let block = render_pointer_block(&[pointer("notes", "only-one")]);
 
         assert!(block.contains(NOTES_PREAMBLE));
         assert!(!block.contains(MEMORY_PREAMBLE));
+        assert!(!block.contains(TRANSCRIPT_PREAMBLE));
     }
 
-    /// An unrecognized label is not "memory", so it must fall back to notes
-    /// framing -- the rule is "memory is special", not "first root wins".
+    /// An unrecognized label is neither `memory` nor `transcripts`, so it must
+    /// fall back to notes framing -- the rule is "those two labels are
+    /// special", not "first root wins".
     #[test]
     fn unknown_label_gets_notes_framing() {
         let block = render_pointer_block(&[pointer("scratch", "mystery-root")]);
 
         assert!(block.contains(NOTES_PREAMBLE));
         assert!(!block.contains(MEMORY_PREAMBLE));
+        assert!(!block.contains(TRANSCRIPT_PREAMBLE));
+    }
+
+    /// A transcript pointer must not read like a note pointer. A note is
+    /// something someone decided to write down; a transcript is a record of
+    /// working something out, and it deliberately contains approaches that were
+    /// tried and dropped. The whole block is asserted here rather than a
+    /// substring so an emptied or reworded preamble cannot pass.
+    #[test]
+    fn a_transcript_pointer_is_framed_as_a_record() {
+        let mut ptr = pointer("transcripts", "2026-09-13-cache");
+        ptr.heading_path = "Turn 4 > Not continued".to_string();
+        let block = render_pointer_block(&[ptr]);
+
+        let framing = "Relevant session transcript pointers -- a record of a conversation, not \
+            its conclusions. Read the exact file path; do not call sloop_search for the same \
+            query. Read around the hit; the surrounding turns are what give it meaning. A `Not \
+            continued` heading marks an approach the session tried and dropped -- not a \
+            finding.\n";
+        let hit = "  2026-09-13-cache.md > Turn 4 > Not continued  (source transcripts, \
+            cos 0.42, captured 2026-08-01)\n";
+        assert_eq!(
+            block,
+            format!("<sloop-recall>\n{framing}{hit}</sloop-recall>")
+        );
+    }
+
+    /// Every root gets its own framing, each pointer sits under the one that
+    /// describes it, and a root that appears twice is collected into a single
+    /// group rather than repeating its preamble.
+    #[test]
+    fn all_three_roots_each_get_their_own_framing() {
+        let block = render_pointer_block(&[
+            pointer("notes", "debounce"),
+            pointer("memory", "prefers-worktrees"),
+            pointer("transcripts", "2026-09-13-cache"),
+            pointer("notes", "chunking"),
+        ]);
+
+        assert_eq!(
+            block,
+            format!(
+                "<sloop-recall>\n{NOTES_PREAMBLE}{}{}{MEMORY_PREAMBLE}{}\
+                 {TRANSCRIPT_PREAMBLE}{}</sloop-recall>",
+                line("notes", "debounce"),
+                line("notes", "chunking"),
+                line("memory", "prefers-worktrees"),
+                line("transcripts", "2026-09-13-cache"),
+            )
+        );
+    }
+
+    /// Paired with the test above, which sees the same three roots in the
+    /// opposite order: no fixed group order can satisfy both, so this pins
+    /// "first appearance wins" rather than any table baked into the renderer.
+    #[test]
+    fn group_order_follows_first_appearance_in_the_input() {
+        let block = render_pointer_block(&[
+            pointer("transcripts", "2026-09-13-cache"),
+            pointer("memory", "prefers-worktrees"),
+            pointer("notes", "debounce"),
+        ]);
+
+        assert_eq!(
+            block,
+            format!(
+                "<sloop-recall>\n{TRANSCRIPT_PREAMBLE}{}{MEMORY_PREAMBLE}{}\
+                 {NOTES_PREAMBLE}{}</sloop-recall>",
+                line("transcripts", "2026-09-13-cache"),
+                line("memory", "prefers-worktrees"),
+                line("notes", "debounce"),
+            )
+        );
     }
 
     /// The notes preamble must not claim the corpus is memory -- a notes root is
