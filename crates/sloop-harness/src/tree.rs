@@ -164,6 +164,15 @@ impl Tree {
         self.nodes.get_mut(usize::try_from(id.0).ok()?)
     }
 
+    /// This node's children, in append order.
+    ///
+    /// Empty for a leaf. The order is the order the branches were created,
+    /// which is what lets a renderer put the spine first.
+    #[must_use]
+    pub fn children(&self, id: NodeId) -> Option<&[NodeId]> {
+        Some(&self.node(id)?.children)
+    }
+
     /// Hang a block under `parent`, returning the new node.
     ///
     /// Called twice on the same parent, this is a fork. Called on a leaf, it
@@ -220,6 +229,12 @@ impl Tree {
     #[must_use]
     pub fn block(&self, id: NodeId) -> Option<&ContentBlock> {
         Some(&self.node(id)?.block)
+    }
+
+    /// This node's role.
+    #[must_use]
+    pub fn role(&self, id: NodeId) -> Option<Role> {
+        Some(self.node(id)?.role)
     }
 
     /// The label placed on this node, ignoring its ancestors.
@@ -415,6 +430,21 @@ mod tests {
 
         assert_ne!(a2, a2_alt);
         assert_eq!(tree.leaves(), vec![a2, a2_alt]);
+    }
+
+    #[test]
+    fn children_come_back_in_append_order() {
+        let mut tree = Tree::new(ContentBlock::text("q"));
+        let root = tree.root();
+        let first = tree
+            .append(root, Role::Assistant, ContentBlock::text("a"))
+            .unwrap();
+        let second = tree
+            .append(root, Role::Assistant, ContentBlock::text("b"))
+            .unwrap();
+
+        assert_eq!(tree.children(root), Some(&[first, second][..]));
+        assert_eq!(tree.children(first), Some(&[][..]));
     }
 
     #[test]

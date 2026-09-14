@@ -84,12 +84,55 @@ async fn recall(state: &State, prompt: &str) -> Result<RecallResult> {
             });
         }
     }
-    best.sort_by(|a, b| b.cosine.total_cmp(&a.cosine));
-    best.truncate(config::HOOK_MAX_HITS);
     Ok(RecallResult {
-        pointers: best,
+        pointers: take_round_robin(best, config::HOOK_MAX_HITS),
         top_cosine,
     })
+}
+
+/// Take up to `limit` pointers, cycling through roots so one cannot take every
+/// slot while another has hits above threshold.
+///
+/// Within a root the order stays by cosine, and a root that is the only one
+/// with hits still fills the block. This bounds crowding rather than solving
+/// it: flat retrieval has no notion of level, so every chunk competes as a
+/// peer. Usage feedback and a concept graph are the real answers, and both are
+/// later slices.
+///
+/// Deterministic for a given input: `sort_by` is stable, roots are held in a
+/// `Vec` ordered by first appearance -- so best-first -- and never in a
+/// `HashMap`, whose iteration order is reseeded per process and would make the
+/// same prompt render a different block on each run.
+fn take_round_robin(mut hits: Vec<Pointer>, limit: usize) -> Vec<Pointer> {
+    hits.sort_by(|a, b| b.cosine.total_cmp(&a.cosine));
+
+    let mut by_root: Vec<Vec<Pointer>> = Vec::new();
+    for hit in hits {
+        match by_root.iter_mut().find(|group| {
+            group
+                .first()
+                .is_some_and(|p| p.source_type == hit.source_type)
+        }) {
+            Some(group) => group.push(hit),
+            None => by_root.push(vec![hit]),
+        }
+    }
+
+    // Bounded by the deepest root rather than by "did this round pick
+    // anything", so the loop cannot spin when every root is exhausted.
+    let deepest = by_root.iter().map(Vec::len).max().unwrap_or(0);
+    let mut picked = Vec::with_capacity(limit);
+    for round in 0..deepest {
+        for group in &by_root {
+            if picked.len() == limit {
+                return picked;
+            }
+            if let Some(hit) = group.get(round) {
+                picked.push(hit.clone());
+            }
+        }
+    }
+    picked
 }
 
 async fn dispatch(state: &State, req: Request) -> Response {
@@ -341,4 +384,141 @@ pub async fn serve() -> Result<()> {
     tracing::info!("shutting down");
     let _ = std::fs::remove_file(&socket);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::take_round_robin;
+    use sloop_memory_core::proto::Pointer;
+
+    fn pointer(source_type: &str, cosine: f32) -> Pointer {
+        Pointer {
+            title: String::new(),
+            source_type: source_type.to_string(),
+            path: String::new(),
+            rel_path: String::new(),
+            heading_path: String::new(),
+            captured: String::new(),
+            cosine,
+        }
+    }
+
+    /// Labels alone are ambiguous once a root appears twice, so pin the cosine
+    /// with it: the pair fixes both the interleaving and the within-root order.
+    fn labelled(picked: &[Pointer]) -> Vec<(&str, f32)> {
+        picked
+            .iter()
+            .map(|p| (p.source_type.as_str(), p.cosine))
+            .collect()
+    }
+
+    // Transcripts are voluminous next to notes -- one session outweighs anything
+    // written down deliberately -- so a global sort by cosine hands every slot to
+    // whichever root is wordiest. Round-robin bounds that without a ranking model.
+    #[test]
+    fn no_single_root_takes_every_pointer_slot() {
+        let hits = vec![
+            pointer("transcripts", 0.95),
+            pointer("transcripts", 0.94),
+            pointer("transcripts", 0.93),
+            pointer("notes", 0.80),
+        ];
+
+        let picked = take_round_robin(hits, 3);
+        let labels: Vec<&str> = picked.iter().map(|p| p.source_type.as_str()).collect();
+
+        assert_eq!(labels, vec!["transcripts", "notes", "transcripts"]);
+    }
+
+    #[test]
+    fn one_root_still_fills_the_block_when_it_is_the_only_one() {
+        let hits = vec![
+            pointer("notes", 0.90),
+            pointer("notes", 0.85),
+            pointer("notes", 0.80),
+        ];
+
+        assert_eq!(take_round_robin(hits, 3).len(), 3);
+    }
+
+    /// Three roots must each get a slot before any root gets a second one, and
+    /// the roots themselves must be visited best-first -- otherwise the block's
+    /// leading pointer stops being the strongest match.
+    #[test]
+    fn every_root_gets_a_slot_before_any_root_gets_a_second() {
+        let hits = vec![
+            pointer("transcripts", 0.95),
+            pointer("transcripts", 0.90),
+            pointer("transcripts", 0.85),
+            pointer("notes", 0.80),
+            pointer("notes", 0.70),
+            pointer("memory", 0.60),
+        ];
+
+        let picked = take_round_robin(hits, 5);
+
+        assert_eq!(
+            labelled(&picked),
+            vec![
+                ("transcripts", 0.95),
+                ("notes", 0.80),
+                ("memory", 0.60),
+                ("transcripts", 0.90),
+                ("notes", 0.70),
+            ]
+        );
+    }
+
+    /// Interleaving reorders across roots but must not reorder within one: a
+    /// root's own hits stay descending, and a root that runs dry drops out
+    /// while the others keep filling.
+    #[test]
+    fn a_roots_own_hits_stay_in_descending_cosine_order() {
+        let hits = vec![
+            pointer("notes", 0.40),
+            pointer("transcripts", 0.99),
+            pointer("notes", 0.90),
+            pointer("transcripts", 0.10),
+            pointer("notes", 0.65),
+        ];
+
+        let picked = take_round_robin(hits, 5);
+
+        assert_eq!(
+            labelled(&picked),
+            vec![
+                ("transcripts", 0.99),
+                ("notes", 0.90),
+                ("transcripts", 0.10),
+                ("notes", 0.65),
+                ("notes", 0.40),
+            ]
+        );
+    }
+
+    /// The limit cuts mid-round, not at a round boundary -- rounding it up to
+    /// the next whole round would overrun the block budget.
+    #[test]
+    fn the_limit_cuts_part_way_through_a_round() {
+        let hits = vec![
+            pointer("transcripts", 0.95),
+            pointer("notes", 0.80),
+            pointer("memory", 0.60),
+            pointer("transcripts", 0.90),
+        ];
+
+        let picked = take_round_robin(hits, 2);
+
+        assert_eq!(
+            labelled(&picked),
+            vec![("transcripts", 0.95), ("notes", 0.80)]
+        );
+    }
+
+    /// Nothing above threshold is the ordinary case for an unrelated prompt;
+    /// the round loop has to terminate on it rather than spin.
+    #[test]
+    fn no_hits_yields_no_pointers() {
+        assert_eq!(labelled(&take_round_robin(vec![], 3)), vec![]);
+    }
 }

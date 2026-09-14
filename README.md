@@ -25,19 +25,32 @@ it needs the notes -- that kind of trigger fails silently on questions that do
 not announce themselves.  This is deliberately separate so it can be embedded
 into any harness.
 
-`sloop-harness` is meant to handle the other half. Feeding a transcript back
-into the index is only safe if you can tell what the transcript *concluded*
-from what it *rejected*. A branching harness records which branches were kept
-and which were abandoned, so a labeled rejection stays distinguishable from a
-conclusion -- and that label is what would make discarded reasoning safe to
-index, rather than turning every rejected idea into a retrievable fact.
+`sloop-harness` handles the other half. It holds a conversation as a tree of
+content blocks, streams turns into it from the Messages API, forks a branch at
+a block boundary and regenerates it -- and writes the whole session as markdown
+into a root the daemon already watches. Four seconds later it is retrievable.
+Nothing else connects them: the harness writes a file, the watcher indexes it,
+and the daemon stays the only writer to the index.
 
-It holds a conversation tree today: nodes are content blocks, each carries a
-kept / abandoned / pending label, and any branch replays to a `messages[]`
-array. It now sends one too -- a streaming client decodes a turn back into
-blocks the tree accepts, so a branch can be forked at a block boundary and
-regenerated against the live API. What it does not yet do is feed any of that
-back into the index, which is the half that closes the loop.
+Feeding a transcript back is only safe if a rejected idea cannot come back as a
+fact. This project spent a while believing the answer was a kept / abandoned
+label on every node, and that turned out to be wrong. The unsafety was never
+the missing label; it was stripping a block out of its context and presenting
+it as an assertion. A label is metadata, the text is what gets read, and every
+consumer has to remember to join them.
+
+What replaces it is structural, and it is cheaper. A branch that was tried and
+dropped renders under a `### Not continued` heading, and the chunker turns
+headings into the `heading_path` it carries on every chunk. That path goes into
+the pointer the prompt hook injects, and into the text that gets embedded and
+matched. So a hit inside a discarded branch says so in every retrieval path,
+and no code has to remember to make it say so. The heading is the label, and it
+cannot be stripped by a renderer that forgets it exists.
+
+The tree keeps its kept / abandoned labels for the harness's own use -- which
+branch is live, what to display -- and the indexer does not read them.
+[`docs/plans/2026-09-13-transcript-indexing-design.md`](docs/plans/2026-09-13-transcript-indexing-design.md)
+records the argument, including what was tried first.
 
 ## The parts
 
@@ -45,7 +58,7 @@ back into the index, which is the half that closes the loop.
 |---|---|
 | [`sloop-memory-core`](crates/sloop-memory-core) | Library. Chunking, embedding, index building, hybrid retrieval, and the daemon's socket protocol. |
 | [`sloop-memory`](crates/sloop-memory) | Binary. A resident daemon with a filesystem watcher, an MCP server, a CLI, and a Claude Code prompt hook. |
-| [`sloop-harness`](crates/sloop-harness) | Binary. A branching agent harness over the Anthropic Messages API. Holds the conversation tree and streams turns into it; no tools, and nothing indexed back yet. |
+| [`sloop-harness`](crates/sloop-harness) | Binary. A branching agent harness over the Anthropic Messages API. Holds the conversation tree, streams turns into it, and writes each session to the `transcripts` root for the daemon to index. No tools yet. |
 
 The library/binary split exists so a consumer can link the engine directly and
 call it in-process instead of standing up a daemon and talking to it over a Unix
