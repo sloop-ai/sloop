@@ -198,6 +198,22 @@ The harness does not index. There is exactly one writer to the index, the
 daemon, which is what keeps the harness writing files and the watcher indexing
 them from racing on the same rows.
 
+**Run end to end on 2026-09-13.** A scratch daemon over two roots
+(`transcripts` and `notes`), started before the transcript existed so that the
+startup sweep could not be what indexed it. Dropping a file written by
+`record` into the watched root logged `reindexed from watch root=transcripts
+changed=1 chunks=3` five seconds later. Searching the abandoned branch's
+vocabulary returned it as the top hit at cos 0.82, pointing at
+`... > Turn 1 > Not continued`, with the same string inside the chunk text.
+`recall` returned two pointers, one per root, under their separate preambles
+-- so round-robin holds and the third preamble is live.
+
+The content blocks were canned rather than fetched, since `MESSAGES_URL` is a
+constant and a live run spends tokens. Everything downstream of them was the
+real path: `main`'s own `graft`, `fork_point` and `record`. What remains
+unverified is only whether real API block shapes render differently from
+canned ones.
+
 ## Crowding
 
 `recall` sorts hits globally by cosine and truncates to `HOOK_MAX_HITS`
