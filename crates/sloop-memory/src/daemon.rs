@@ -15,7 +15,7 @@ use tokio::sync::Mutex;
 
 use crate::watch;
 use sloop_memory_core::proto::{Pointer, Request, Response};
-use sloop_memory_core::{config, embed::Embedder, index, store};
+use sloop_memory_core::{chunk, config, embed::Embedder, index, store};
 
 struct State {
     embedder: Mutex<Embedder>,
@@ -96,8 +96,17 @@ async fn recall(state: &State, prompt: &str) -> Result<RecallResult> {
         });
     };
 
-    let qvec = { state.embedder.lock().await.encode_query(prompt)? };
-    let hits = store::hybrid_search(&table, qvec, prompt, config::HOOK_MAX_HITS * 4, None).await?;
+    // One search per unit, concatenated. `consolidate` reduces them to the
+    // best cosine per file, so a note answering any part of a long query is a
+    // hit. A query that fits the chunk-size bound splits to one unit and this
+    // is the path it took before.
+    let mut hits = Vec::new();
+    for unit in chunk::split_query(prompt) {
+        let qvec = { state.embedder.lock().await.encode_query(&unit)? };
+        hits.extend(
+            store::hybrid_search(&table, qvec, &unit, config::HOOK_MAX_HITS * 4, None).await?,
+        );
+    }
     let top_cosine = hits.iter().map(|h| h.cosine).max_by(f32::total_cmp);
 
     let pairs: Vec<(&str, &Path)> = state
