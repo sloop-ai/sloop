@@ -345,6 +345,7 @@ pub fn parse_note(title: &str, source: &str) -> ParsedNote {
 #[expect(clippy::unwrap_used, reason = "see comment above")]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use std::fmt::Write as _;
 
     /// A markdown table has no blank lines, so blank-line splitting alone would
@@ -503,5 +504,78 @@ mod tests {
                 .is_some_and(|u| u.contains("why does the cache never expire?")),
             "the cap dropped the question at the tail"
         );
+    }
+
+    // ---- the size bound over arbitrary text ---------------------------------
+    //
+    // The examples above are inputs someone thought of. The shapes that break a
+    // splitter -- a paragraph with no blank lines, one unbroken line longer than
+    // the cap, lone newlines, empty fragments -- are the ones nobody writes
+    // down, so they are generated instead.
+
+    /// One piece of a generated query. Only the length matters, not the
+    /// letters: `units` branches on whether a paragraph fits `MAX_CHARS` and,
+    /// inside an over-long paragraph, on whether a single line does. The long
+    /// arm straddles `MAX_CHARS` so that both sides of that second branch come
+    /// up. The short arm reaches the empty string, which is how blank lines and
+    /// runs of lone newlines get generated.
+    fn fragment() -> impl Strategy<Value = String> {
+        prop_oneof![
+            4 => "[a-z ]{0,120}",
+            2 => "[a-z]{1200,3000}",
+        ]
+    }
+
+    /// The separators are the experiment. `\n\n` opens a paragraph, `\n` opens
+    /// a line within one, and the empty separator glues two fragments into a
+    /// single line that can outgrow `MAX_CHARS` on its own.
+    ///
+    /// A regex over `.` cannot do this job, with or without `(?s)`: proptest
+    /// draws `.` from the whole character range, so a newline -- let alone two
+    /// adjacent ones -- essentially never appears, and every generated input
+    /// would be one enormous line taking the same single branch.
+    fn separator() -> impl Strategy<Value = String> {
+        prop_oneof![
+            3 => "\n\n",
+            4 => "\n",
+            2 => "",
+            1 => " ",
+        ]
+    }
+
+    fn query() -> impl Strategy<Value = String> {
+        prop::collection::vec((separator(), fragment()), 0..32).prop_map(|parts| {
+            let mut out = String::new();
+            for (separator, fragment) in parts {
+                out.push_str(&separator);
+                out.push_str(&fragment);
+            }
+            out
+        })
+    }
+
+    proptest! {
+        /// Two bounds hold for any input: `split_body` holds every unit to
+        /// `MAX_CHARS` characters, and the cap holds the count. Neither is a
+        /// statement about tokens -- dense text runs 2-3 characters per token,
+        /// so a full-size unit can still be truncated downstream.
+        #[test]
+        fn every_unit_respects_the_chunk_size_bound(query in query()) {
+            let units = split_query(&query);
+
+            prop_assert!(
+                units.len() <= config::MAX_QUERY_UNITS,
+                "{} units exceeds the cap of {}",
+                units.len(),
+                config::MAX_QUERY_UNITS
+            );
+            for unit in &units {
+                prop_assert!(
+                    unit.chars().count() <= MAX_CHARS,
+                    "unit of {} chars exceeds {MAX_CHARS}",
+                    unit.chars().count()
+                );
+            }
+        }
     }
 }
