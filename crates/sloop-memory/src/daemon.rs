@@ -3,7 +3,8 @@
 //! Exists for one reason: loading the ONNX model costs ~1s, and a query costs
 //! ~3ms. Anything on the prompt path has to pay the former once, not per call.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -82,6 +83,53 @@ fn consolidate(hits: Vec<store::Hit>, roots: &[(&str, &Path)]) -> Vec<Pointer> {
     best
 }
 
+/// Reduce the concatenated per-unit hits to the `k` the MCP caller asked for.
+///
+/// Deliberately not `consolidate`: this path hands back chunk bodies, so two
+/// chunks of one file are two distinct answers and both may stand. What cannot
+/// stand is the *same* chunk repeated, which a split query produces the moment
+/// one chunk matches more than one unit -- without this, `k` = 3 could be one
+/// chunk three times. There is no cosine gate here either: `HOOK_MIN_COSINE`
+/// is the hook's policy, and a caller asking for `k` wants `k`.
+fn best_k(mut hits: Vec<store::Hit>, k: usize) -> Vec<store::Hit> {
+    hits.sort_by(|a, b| b.cosine.total_cmp(&a.cosine));
+    // Sorted descending, a chunk's first appearance carries its best cosine.
+    // `text` is in the key because a section longer than one chunk yields
+    // several chunks sharing a `rel_path` and a `heading_path`.
+    let mut seen: HashSet<(String, String, String)> = HashSet::new();
+    hits.retain(|h| seen.insert((h.source_type.clone(), h.rel_path.clone(), h.text.clone())));
+    hits.truncate(k);
+    hits
+}
+
+/// Split `query` and search every unit, concatenating the hits.
+///
+/// The truncating tokenizer keeps the first 512 tokens of whatever it is
+/// handed, so a single `encode_query` over a pasted log reads the boilerplate
+/// and never reaches the question underneath it. Splitting first means every
+/// part of the query gets its own search. A query that already fits the
+/// chunk-size bound splits to one unit and takes exactly the path it did
+/// before.
+///
+/// `search_one` is a parameter so the loop can be tested without a model or a
+/// table: the caller supplies the embed-and-search step, a test supplies a
+/// stub. It takes the unit by value because the future it returns outlives the
+/// call that made it, and returns a future rather than being an `async fn` in a
+/// trait so that the embedder guard stays inside the caller's own statement --
+/// `clippy::await_holding_lock` is denied, and a guard passed across this
+/// boundary would be held across the search.
+async fn search_units<F, Fut>(query: &str, mut search_one: F) -> Result<Vec<store::Hit>>
+where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = Result<Vec<store::Hit>>>,
+{
+    let mut hits = Vec::new();
+    for unit in chunk::split_query(query) {
+        hits.extend(search_one(unit).await?);
+    }
+    Ok(hits)
+}
+
 async fn recall(state: &State, prompt: &str) -> Result<RecallResult> {
     if prompt.trim().is_empty() {
         return Ok(RecallResult {
@@ -96,17 +144,14 @@ async fn recall(state: &State, prompt: &str) -> Result<RecallResult> {
         });
     };
 
-    // One search per unit, concatenated. `consolidate` reduces them to the
-    // best cosine per file, so a note answering any part of a long query is a
-    // hit. A query that fits the chunk-size bound splits to one unit and this
-    // is the path it took before.
-    let mut hits = Vec::new();
-    for unit in chunk::split_query(prompt) {
+    // `consolidate` reduces the concatenated hits to the best cosine per file,
+    // so a note answering any part of a long query is a hit.
+    let table = &table;
+    let hits = search_units(prompt, |unit| async move {
         let qvec = { state.embedder.lock().await.encode_query(&unit)? };
-        hits.extend(
-            store::hybrid_search(&table, qvec, &unit, config::HOOK_MAX_HITS * 4, None).await?,
-        );
-    }
+        store::hybrid_search(table, qvec, &unit, config::HOOK_MAX_HITS * 4, None).await
+    })
+    .await?;
     let top_cosine = hits.iter().map(|h| h.cosine).max_by(f32::total_cmp);
 
     let pairs: Vec<(&str, &Path)> = state
@@ -198,22 +243,37 @@ async fn dispatch(state: &State, req: Request) -> Response {
                     }
                 }
             };
-            let qvec = match state.embedder.lock().await.encode_query(&query) {
-                Ok(v) => v,
+            // Same split as the hook path: MCP callers paste logs too. A unit
+            // that fails to embed or search fails the whole request rather
+            // than quietly returning the other units' hits -- a short answer
+            // is indistinguishable from a complete one to the caller.
+            //
+            // An empty or whitespace-only query splits to no units at all and
+            // so returns an empty hit list, not an error. That is the intended
+            // contract of this arm and not an accident of the split: it
+            // replaced embedding the empty string and searching on it, which
+            // answered a question nobody asked. Both callers today reject an
+            // empty query before it gets here (`mcp.rs`, and the CLI's
+            // positional argument), but the next host to speak this protocol
+            // will not have read either of them.
+            let table = &table;
+            let filter = filter.as_deref();
+            let searched = search_units(&query, |unit| async move {
+                let qvec = { state.embedder.lock().await.encode_query(&unit)? };
+                store::hybrid_search(table, qvec, &unit, k, filter).await
+            })
+            .await;
+            let hits = match searched {
+                Ok(hits) => best_k(hits, k),
                 Err(e) => {
                     return Response::Error {
                         message: e.to_string(),
                     }
                 }
             };
-            match store::hybrid_search(&table, qvec, &query, k, filter.as_deref()).await {
-                Ok(hits) => Response::Hits {
-                    hits,
-                    elapsed_ms: ms(started),
-                },
-                Err(e) => Response::Error {
-                    message: e.to_string(),
-                },
+            Response::Hits {
+                hits,
+                elapsed_ms: ms(started),
             }
         }
 
@@ -418,10 +478,16 @@ pub async fn serve() -> Result<()> {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::unwrap_used,
+    reason = "a test reports failure by panicking, and an unwrap is one way"
+)]
 mod tests {
-    use super::{consolidate, take_round_robin};
+    use std::cell::RefCell;
+
+    use super::{best_k, consolidate, search_units, take_round_robin};
     use sloop_memory_core::proto::Pointer;
-    use sloop_memory_core::store;
+    use sloop_memory_core::{chunk, store};
 
     fn hit(source_type: &str, rel_path: &str, heading: &str, cosine: f32) -> store::Hit {
         store::Hit {
@@ -621,5 +687,152 @@ mod tests {
         let hits = vec![hit("notes", "unrelated.md", "H", 0.40)];
 
         assert!(consolidate(hits, &[]).is_empty());
+    }
+
+    /// The claim the whole slice rests on, checked at the wiring: a pasted log
+    /// with the question underneath it must search the question too, and the
+    /// question's match must reach the caller. The stub stands in for
+    /// embed-and-search, so this needs neither a model nor a table.
+    ///
+    /// Searching only the first unit, or dropping the tail, are the wiring
+    /// mistakes with the quietest symptoms: short queries keep working either
+    /// way. Both fail here on the unit count.
+    #[tokio::test]
+    async fn a_match_in_only_the_last_unit_still_reaches_the_hits() {
+        const QUESTION: &str = "why does the cache never expire?";
+        let paste = "stack frame line\n".repeat(400);
+        let query = format!("{paste}\n{QUESTION}");
+        let units = chunk::split_query(&query);
+        assert!(units.len() > 1, "the fixture query did not split");
+
+        let searched = RefCell::new(Vec::new());
+        let log = &searched;
+        let hits = search_units(&query, |unit| async move {
+            log.borrow_mut().push(unit.clone());
+            // Only the tail carries the question, so only the tail matches.
+            let matched = unit.contains(QUESTION);
+            anyhow::Ok(if matched {
+                vec![hit("notes", "cache.md", "Expiry", 0.88)]
+            } else {
+                vec![]
+            })
+        })
+        .await
+        .unwrap();
+
+        // Counted before compared: a unit is a kilobyte of pasted log, and the
+        // common failure -- searching a prefix of them -- is legible as a count
+        // and unreadable as two dumped lists.
+        let searched = searched.into_inner();
+        assert_eq!(
+            searched.len(),
+            units.len(),
+            "searched {} of {} units",
+            searched.len(),
+            units.len()
+        );
+        assert_eq!(searched, units, "the units reached the search mangled");
+        assert_eq!(hits.len(), 1, "the tail unit's only match did not survive");
+        assert_eq!(hits[0].rel_path, "cache.md");
+    }
+
+    /// The contract `Request::Search` now offers a host that has not read its
+    /// callers: an empty query is no units, so no search runs and the answer
+    /// is an empty hit list rather than an error. Pinned rather than merely
+    /// commented, because it is the behaviour of `split_query` and nothing in
+    /// this file would notice if that changed.
+    #[tokio::test]
+    async fn an_empty_query_searches_nothing_and_is_not_an_error() {
+        for query in ["", "   ", "\n\t\n"] {
+            let calls = RefCell::new(0_usize);
+            let seen = &calls;
+            let hits = search_units(query, |_unit| async move {
+                *seen.borrow_mut() += 1;
+                anyhow::Ok(vec![hit("notes", "anything.md", "H", 0.99)])
+            })
+            .await
+            .unwrap();
+
+            assert_eq!(calls.into_inner(), 0, "{query:?} reached the embedder");
+            assert!(hits.is_empty(), "{query:?} produced hits");
+        }
+    }
+
+    /// A failing unit fails the request. A short answer is indistinguishable
+    /// from a complete one to the caller, so the other units' hits must not be
+    /// handed back as if nothing went wrong.
+    #[tokio::test]
+    async fn one_unit_failing_fails_the_whole_search() {
+        let paste = "stack frame line\n".repeat(400);
+        let query = format!("{paste}\nwhy does the cache never expire?");
+
+        let calls = RefCell::new(0_usize);
+        let seen = &calls;
+        let result = search_units(&query, |_unit| async move {
+            *seen.borrow_mut() += 1;
+            Err::<Vec<store::Hit>, _>(anyhow::anyhow!("embedder is wedged"))
+        })
+        .await;
+
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "embedder is wedged",
+            "the unit's own error has to survive to the caller"
+        );
+        assert_eq!(calls.into_inner(), 1, "kept searching after a failure");
+    }
+
+    fn chunk_hit(rel_path: &str, text: &str, cosine: f32) -> store::Hit {
+        store::Hit {
+            text: text.to_string(),
+            ..hit("notes", rel_path, "H", cosine)
+        }
+    }
+
+    /// Splitting makes one chunk matchable by several units. Without the
+    /// dedup, `k` = 3 could be the same chunk three times.
+    #[test]
+    fn a_chunk_matched_by_two_units_is_returned_once_at_its_best_cosine() {
+        let hits = vec![
+            chunk_hit("cache.md", "the cache entry never expires", 0.71),
+            chunk_hit("cache.md", "the cache entry never expires", 0.93),
+        ];
+
+        let out = best_k(hits, 3);
+
+        assert_eq!(out.len(), 1, "the same chunk came back twice");
+        assert!(
+            (out[0].cosine - 0.93).abs() < f32::EPSILON,
+            "{}",
+            out[0].cosine
+        );
+    }
+
+    /// Unlike the hook's `consolidate`, this path returns bodies, so two
+    /// distinct chunks of one file are two distinct answers.
+    #[test]
+    fn two_chunks_of_one_file_both_stand() {
+        let hits = vec![
+            chunk_hit("cache.md", "eviction runs hourly", 0.90),
+            chunk_hit("cache.md", "the TTL is never read", 0.80),
+        ];
+
+        assert_eq!(best_k(hits, 3).len(), 2);
+    }
+
+    /// `k` is what the caller asked for, not `k` per unit -- and the `k` kept
+    /// are the best, whichever unit found them.
+    #[test]
+    fn the_hits_are_cut_to_k_best_first() {
+        let hits = vec![
+            chunk_hit("a.md", "first unit, weak", 0.40),
+            chunk_hit("b.md", "first unit, strong", 0.95),
+            chunk_hit("c.md", "last unit, middling", 0.70),
+        ];
+
+        let out = best_k(hits, 2);
+
+        let texts: Vec<&str> = out.iter().map(|h| h.text.as_str()).collect();
+        assert_eq!(texts, vec!["first unit, strong", "last unit, middling"]);
     }
 }
