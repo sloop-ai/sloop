@@ -5,6 +5,7 @@
 //! text, which gives both the vector and the BM25 side something to bite on when
 //! a chunk's body is mostly prose that never repeats the term.
 
+use crate::config;
 use std::collections::BTreeSet;
 
 /// Bumped whenever chunking changes. It is folded into each file's content hash,
@@ -210,6 +211,39 @@ fn split_body(body: &str) -> Vec<String> {
         .collect()
 }
 
+/// Split a query on the same character bound documents get.
+///
+/// Deliberately the same splitter. `split_body` holds every piece to
+/// `MAX_CHARS`; a query is the other half of that comparison and was bounded
+/// by nothing.
+///
+/// That bound is characters, not tokens, so this narrows the tokenizer's
+/// truncation rather than removing it: dense text tokenizes at 2-3 characters
+/// per token, so a full-size unit of log or code can still exceed
+/// `MAX_SEQ_LEN`. Fixing that means lowering `MAX_CHARS`, which touches
+/// document indexing too.
+///
+/// A query that already fits comes back as one unit, which is the common
+/// case by a wide margin. Whitespace-only input yields no units; callers must
+/// reject empty queries, as the search paths do before reaching here.
+///
+/// Above [`config::MAX_QUERY_UNITS`] the cap keeps the first
+/// `MAX_QUERY_UNITS - 1` units and the last one.
+#[must_use]
+pub fn split_query(query: &str) -> Vec<String> {
+    let mut units = split_body(query);
+    if units.len() > config::MAX_QUERY_UNITS {
+        // Keep the last unit. Dropping it would reproduce at a higher
+        // threshold the very failure this function removes: a pasted log
+        // with the question underneath it, read from the boilerplate at
+        // the top. The middle is what a paste can spare.
+        let tail = units.remove(units.len() - 1);
+        units.truncate(config::MAX_QUERY_UNITS - 1);
+        units.push(tail);
+    }
+    units
+}
+
 /// Chunk one markdown file.
 ///
 /// `title` is the filename stem rather than the H1 (see `index::note_title`),
@@ -386,5 +420,88 @@ mod tests {
         assert_eq!(note.frontmatter.captured, "2026-04-10");
         assert_eq!(note.frontmatter.tags, vec!["infra", "caching"]);
         assert!(!note.chunks.iter().any(|c| c.text.contains("captured:")));
+    }
+
+    // ---- query splitting --------------------------------------------------
+    //
+    // A query is one half of the same comparison a chunk is, so it gets the
+    // same splitter. These pin what the search path depends on: a short query
+    // stays one unit, a long one keeps its tail, nothing exceeds the chunk-size
+    // bound, and the cap holds without throwing the tail away.
+
+    #[test]
+    fn a_short_query_is_one_unit_unchanged() {
+        assert_eq!(
+            split_query("how should the cache expire?"),
+            vec!["how should the cache expire?".to_string()]
+        );
+    }
+
+    /// The regression this whole slice exists for. Truncation keeps the head of
+    /// a paste and drops the question at the end; splitting must not.
+    #[test]
+    fn a_long_query_keeps_its_tail() {
+        let paste = "stack frame line\n".repeat(400);
+        let query = format!("{paste}\nwhy does the cache never expire?");
+
+        let units = split_query(&query);
+
+        assert!(
+            units.len() > 1,
+            "a {}-char query did not split",
+            query.len()
+        );
+        assert!(
+            units
+                .last()
+                .is_some_and(|u| u.contains("why does the cache never expire?")),
+            "the question at the tail reached no unit"
+        );
+    }
+
+    #[test]
+    fn units_never_exceed_the_chunk_size_bound() {
+        let query = "word ".repeat(20_000);
+        for unit in split_query(&query) {
+            assert!(
+                unit.chars().count() <= MAX_CHARS,
+                "unit of {} chars exceeds {MAX_CHARS}",
+                unit.chars().count()
+            );
+        }
+    }
+
+    #[test]
+    fn a_whitespace_only_query_yields_no_units() {
+        assert_eq!(split_query("   \n\n  "), Vec::<String>::new());
+    }
+
+    /// The cap is live code. Without this, deleting the truncation changes no
+    /// test result -- the per-unit length assertion is indifferent to count.
+    /// Measured, this fixture splits into 99 units, so the 8 is the cap rather
+    /// than the fixture's own size.
+    #[test]
+    fn a_very_long_query_is_capped() {
+        let units = split_query(&"word ".repeat(20_000));
+        assert_eq!(units.len(), config::MAX_QUERY_UNITS);
+    }
+
+    /// Above the cap the tail still has to survive, or the cap reintroduces the
+    /// failure the splitter exists to remove. Measured, this fixture splits into
+    /// 44 units before capping, so the 8 is the cap rather than a coincidence.
+    #[test]
+    fn a_query_over_the_cap_still_keeps_its_tail() {
+        let paste = "stack frame line\n".repeat(3000);
+        let query = format!("{paste}\nwhy does the cache never expire?");
+
+        let units = split_query(&query);
+
+        assert_eq!(units.len(), config::MAX_QUERY_UNITS);
+        assert!(
+            units
+                .last()
+                .is_some_and(|u| u.contains("why does the cache never expire?")),
+            "the cap dropped the question at the tail"
+        );
     }
 }

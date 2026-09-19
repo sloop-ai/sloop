@@ -13,6 +13,7 @@
 **Baseline:** branch `split-long-queries` off `main` (`2cbb685`), 149 tests passing, clippy and fmt clean.
 
 **House rules that bite here:**
+- **A `cargo test` filter that matches nothing exits 0 and prints `ok. 0 passed`.** It is a green light for a suite that never ran. Filters match the *full test path* (`chunk::tests::a_short_query_is_one_unit_unchanged`), not the function under test — so filtering on `split_query` selects zero tests even when six of them call it. Check the passed count is non-zero before believing any filtered run.
 - `unwrap_used` is **denied**, `expect_used` warned. Test modules carry `#[expect(clippy::unwrap_used, reason = "...")]`.
 - `print_stdout`/`print_stderr` denied.
 - Run everything through `nix develop -c` if the dev shell is not already active (direnv usually has it).
@@ -34,9 +35,9 @@ Add to the `mod tests` block at the bottom of `crates/sloop-memory-core/src/chun
 // ---- query splitting --------------------------------------------------
 //
 // A query is one half of the same comparison a chunk is, so it gets the
-// same splitter. These pin the three things the search path depends on:
-// a short query stays one unit, a long one keeps its tail, and nothing
-// exceeds what the model can read.
+// same splitter. These pin what the search path depends on: a short query
+// stays one unit, a long one keeps its tail, nothing exceeds the chunk-size
+// bound, and the cap holds without throwing the tail away.
 
 #[test]
 fn a_short_query_is_one_unit_unchanged() {
@@ -55,29 +56,62 @@ fn a_long_query_keeps_its_tail() {
 
     assert!(units.len() > 1, "a {}-char query did not split", query.len());
     assert!(
-        units.iter().any(|u| u.contains("why does the cache never expire?")),
+        units.last().is_some_and(|u| u.contains("why does the cache never expire?")),
         "the question at the tail reached no unit"
     );
 }
 
 #[test]
-fn units_never_exceed_what_the_model_can_read() {
+fn units_never_exceed_the_chunk_size_bound() {
     let query = "word ".repeat(20_000);
     for unit in split_query(&query) {
-        assert!(unit.chars().count() <= MAX_CHARS, "unit of {} chars", unit.chars().count());
+        assert!(
+            unit.chars().count() <= MAX_CHARS,
+            "unit of {} chars exceeds {MAX_CHARS}",
+            unit.chars().count()
+        );
     }
 }
 
 #[test]
 fn a_whitespace_only_query_yields_no_units() {
-    assert!(split_query("   \n\n  ").is_empty());
+    assert_eq!(split_query("   \n\n  "), Vec::<String>::new());
+}
+
+/// The cap is live code. Without this, deleting the truncation changes no
+/// test result -- the per-unit length assertion is indifferent to count.
+/// Measured, this fixture splits into 99 units, so the 8 is the cap rather
+/// than the fixture's own size.
+#[test]
+fn a_very_long_query_is_capped() {
+    let units = split_query(&"word ".repeat(20_000));
+    assert_eq!(units.len(), config::MAX_QUERY_UNITS);
+}
+
+/// Above the cap the tail still has to survive, or the cap reintroduces the
+/// failure the splitter exists to remove. Measured, this fixture splits into
+/// 44 units before capping, so the 8 is the cap rather than a coincidence.
+#[test]
+fn a_query_over_the_cap_still_keeps_its_tail() {
+    let paste = "stack frame line\n".repeat(3000);
+    let query = format!("{paste}\nwhy does the cache never expire?");
+
+    let units = split_query(&query);
+
+    assert_eq!(units.len(), config::MAX_QUERY_UNITS);
+    assert!(
+        units.last().is_some_and(|u| u.contains("why does the cache never expire?")),
+        "the cap dropped the question at the tail"
+    );
 }
 ```
+
+The paste in the last test must split to **more** than `MAX_QUERY_UNITS` before capping, or it passes vacuously — 3000 lines gives 44 units against a cap of 8. Confirm it by checking that the test fails when the cap is removed (Step 5).
 
 **Step 2: Run them and watch them fail**
 
 ```
-nix develop -c cargo test -p sloop-memory-core split_query
+nix develop -c cargo test -p sloop-memory-core chunk::tests
 ```
 
 Expected: compile error, `cannot find function 'split_query'`.
@@ -87,12 +121,14 @@ Expected: compile error, `cannot find function 'split_query'`.
 In `crates/sloop-memory-core/src/config.rs`, immediately after `HOOK_MIN_COSINE`:
 
 ```rust
-/// How many units a long query splits into before the remainder is dropped.
+/// How many units a long query searches before the middle of it is dropped.
 ///
-/// Eight is roughly 9,600 characters of query. Past that a paste carries less
-/// intent than the searches cost: measured over 220 real prompts the median is
-/// 80 characters and 92% need no splitting at all. Unlike the tokenizer's
-/// truncation this bound is stated rather than silent.
+/// A unit advances `chunk::TARGET_CHARS` less `chunk::OVERLAP_CHARS` of new
+/// text, since each split carries its predecessor's tail forward -- so eight
+/// is roughly 8,000 characters of distinct query at today's values. Past that
+/// a paste carries less intent than the searches cost: measured over 220 real
+/// prompts the median is 80 characters and 92% need no splitting at all.
+/// Unlike the tokenizer's truncation this bound is stated rather than silent.
 pub const MAX_QUERY_UNITS: usize = 8;
 ```
 
@@ -101,26 +137,41 @@ pub const MAX_QUERY_UNITS: usize = 8;
 In `crates/sloop-memory-core/src/chunk.rs`, directly after `split_body`:
 
 ```rust
-/// Split a query into units that each fit the embedding window.
+/// Split a query on the same character bound documents get.
 ///
-/// Deliberately the same splitter documents get. `split_body` exists so no
-/// chunk overflows `MAX_SEQ_LEN`; a query is the other half of that
-/// comparison and was bounded by nothing, so the tokenizer truncated it to
-/// its first 512 tokens -- keeping the head of a pasted log and discarding
-/// the question beneath it.
+/// Deliberately the same splitter. `split_body` holds every piece to
+/// `MAX_CHARS`; a query is the other half of that comparison and was bounded
+/// by nothing.
+///
+/// That bound is characters, not tokens, so this narrows the tokenizer's
+/// truncation rather than removing it: dense text tokenizes at 2-3 characters
+/// per token, so a full-size unit of log or code can still exceed
+/// `MAX_SEQ_LEN`. Fixing that means lowering `MAX_CHARS`, which touches
+/// document indexing too.
 ///
 /// A query that already fits comes back as one unit, which is the common
-/// case by a wide margin. Whitespace-only input yields no units; both
-/// callers reject empty queries before reaching here.
+/// case by a wide margin. Whitespace-only input yields no units; callers must
+/// reject empty queries, as the search paths do before reaching here.
 ///
-/// Capped at [`config::MAX_QUERY_UNITS`].
+/// Above [`config::MAX_QUERY_UNITS`] the cap keeps the first
+/// `MAX_QUERY_UNITS - 1` units and the last one.
 #[must_use]
 pub fn split_query(query: &str) -> Vec<String> {
     let mut units = split_body(query);
-    units.truncate(config::MAX_QUERY_UNITS);
+    if units.len() > config::MAX_QUERY_UNITS {
+        // Keep the last unit. Dropping it would reproduce at a higher
+        // threshold the very failure this function removes: a pasted log
+        // with the question underneath it, read from the boilerplate at
+        // the top. The middle is what a paste can spare.
+        let tail = units.remove(units.len() - 1);
+        units.truncate(config::MAX_QUERY_UNITS - 1);
+        units.push(tail);
+    }
     units
 }
 ```
+
+A plain `units.truncate(MAX_QUERY_UNITS)` is the tempting simplification and it is wrong: it drops the tail, reproducing at ~8,000 characters the exact failure this slice removes. `a_query_over_the_cap_still_keeps_its_tail` is the test that catches it.
 
 Add the import at the top of `chunk.rs` if absent:
 
@@ -128,13 +179,18 @@ Add the import at the top of `chunk.rs` if absent:
 use crate::config;
 ```
 
-**Step 5: Run the tests**
+**Step 5: Run the tests, and prove the cap tests have teeth**
 
 ```
-nix develop -c cargo test -p sloop-memory-core split_query
+nix develop -c cargo test -p sloop-memory-core chunk::tests
 ```
 
-Expected: 4 passed.
+Expected: 11 passed — 5 pre-existing chunk tests plus the 6 added here. (Filtering on `split_query` matches nothing; see the house rule above.)
+
+Then confirm the two cap tests are not vacuous. Per `[[mutation-test-in-a-worktree]]`, mutate in a scratch worktree, never the shared checkout:
+
+- Replace the body with a plain `units.truncate(config::MAX_QUERY_UNITS)` → `a_query_over_the_cap_still_keeps_its_tail` must FAIL with "the cap dropped the question at the tail".
+- Replace the body with a bare `split_body(query)` → both `a_very_long_query_is_capped` and `a_query_over_the_cap_still_keeps_its_tail` must FAIL.
 
 **Step 6: Commit**
 
@@ -183,8 +239,10 @@ proptest::proptest! {
 **Step 3: Run it**
 
 ```
-nix develop -c cargo test -p sloop-memory-core every_unit_fits
+nix develop -c cargo test -p sloop-memory-core chunk::tests
 ```
+
+Expected 12 passed (the 11 from Task 1 plus this property). `every_unit_fits` would also match, but `chunk::tests` shows the whole module's count, which is the number to check against.
 
 Expected: PASS (it should already hold; if it fails, `split_body`'s `hard_split` fallback has a gap and that is a real find — stop and report it rather than weakening the assertion).
 
@@ -270,7 +328,7 @@ And in `recall`, replace the loop with:
 nix develop -c cargo test --workspace
 ```
 
-Expected: 153 passed (149 baseline + 4 from Task 1; Task 2's property counts as 1 → confirm the number and carry it forward).
+Expected: 155 passed (149 baseline + 6 from Task 1; Task 2's property counts as 1 → 156 once Task 2 lands. Confirm the number and carry it forward).
 
 **Step 3: Add the merge test**
 
@@ -309,11 +367,10 @@ Write a small `fn hit(source_type, rel_path, heading, cosine) -> store::Hit` hel
 **Step 4: Run**
 
 ```
-nix develop -c cargo test -p sloop-memory consolidate
-nix develop -c cargo test -p sloop-memory the_best_matching_unit a_unit_below_the_gate
+nix develop -c cargo test -p sloop-memory daemon::tests
 ```
 
-Expected: PASS.
+Expected: 8 passed — the 6 existing `daemon::tests` plus the 2 added here. Filtering on `consolidate` matches nothing (no test path contains it); `daemon::tests` is the filter that selects the module.
 
 **Step 5: Prove the test has teeth**
 

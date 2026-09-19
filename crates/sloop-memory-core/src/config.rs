@@ -39,6 +39,16 @@ pub const HOOK_MAX_HITS: usize = 3;
 /// near 0.3.
 pub const HOOK_MIN_COSINE: f32 = 0.75;
 
+/// How many units a long query searches before the middle of it is dropped.
+///
+/// A unit advances `chunk::TARGET_CHARS` less `chunk::OVERLAP_CHARS` of new
+/// text, since each split carries its predecessor's tail forward -- so eight
+/// is roughly 8,000 characters of distinct query at today's values. Past that
+/// a paste carries less intent than the searches cost: measured over 220 real
+/// prompts the median is 80 characters and 92% need no splitting at all.
+/// Unlike the tokenizer's truncation this bound is stated rather than silent.
+pub const MAX_QUERY_UNITS: usize = 8;
+
 fn env_path(key: &str) -> Option<PathBuf> {
     std::env::var_os(key).map(PathBuf::from)
 }

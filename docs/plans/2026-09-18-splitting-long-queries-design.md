@@ -29,8 +29,10 @@ discards the question at the bottom.
 ## The asymmetry
 
 `chunk::split_body` cuts document bodies at `TARGET_CHARS` (1200), capped at
-`MAX_CHARS` (2000), so that no chunk overflows the model's window. That bound is
-deliberate and it is the reason retrieval works at all on long notes.
+`MAX_CHARS` (2000), so that no chunk greatly overruns the model's window. The
+cap is in characters and the window is in tokens, so it approximates the window
+rather than guaranteeing it — see Known limitations. That bound is deliberate
+and it is the reason retrieval works at all on long notes.
 
 Queries carry no such bound. One side of the comparison is sized to the model
 and the other is not, which is the defect -- truncation is only how it shows up.
@@ -87,19 +89,37 @@ Every host inherits this -- the Claude Code hook, the MCP server, and the
 harness -- with no host-specific code. The truncation is engine-side, so the fix
 belongs engine-side.
 
-BM25 improves as a side effect. Each unit carries its own text into
-`full_text_search`, so the lexical side sees every term rather than the first
-512 tokens' worth.
+BM25 changes, but not in the way this document first claimed. The 512-token
+truncation lives in the embedder's tokenizer (`embed.rs:45`) and bounds the
+query *vector* alone; `hybrid_search` passes the raw query text to
+`FullTextSearchQuery` (`store.rs:329`), so the lexical side always saw every
+term. Splitting recovers nothing there. What it changes is that BM25 runs once
+per unit rather than once over the whole query, which widens the candidate pool
+feeding RRF instead of restoring lost coverage. The gain this slice delivers is
+on the vector side.
 
 ## The cap
 
-A 28,341-character paste splits into roughly fourteen units, and fourteen
-searches to serve one prompt is too many. Units are capped at 8, about 9,600
-characters of query.
+A unit advances about 1,000 characters of distinct text: packing targets
+`TARGET_CHARS` (1,200) and carries `OVERLAP_CHARS` (200) forward into the next
+one. Every figure here is on that basis — measured, 100,000 characters produce
+99 units.
+
+So a 28,341-character paste splits into roughly 28 units, and 28 searches to
+serve one prompt is too many. Units are capped at 8, about 8,000 characters of
+distinct query.
 
 Past that point more paste carries less intent, and the bound is stated rather
 than silent. That is the difference from today: truncation discards without
 saying so, while the cap discards a documented amount.
+
+The cap keeps the leading units **and the final one** — the first seven and the
+last, not the first eight. Taking units from the front alone would reproduce the
+original failure at a higher threshold: a pasted log with the question typed
+underneath it would again be read entirely from the boilerplate at the top. The
+middle of a paste is what it can spare, because the question usually sits at the
+end. Keeping the tail costs nothing, so the cap bounds the work without
+reintroducing what the splitter exists to remove.
 
 `top_cosine` becomes the maximum across units, keeping miss logging comparable
 to the existing record.
@@ -116,6 +136,31 @@ A query above the cap, asserting the bound holds.
 A property: `split_query` never emits a unit longer than `MAX_CHARS`. The whole
 design rests on that invariant, and a property test covers inputs no example
 would think to include.
+
+## Known limitations
+
+Both are accepted for this slice, not solved by it.
+
+**Residual truncation.** The bound is characters, the window is tokens, so
+splitting narrows the truncation rather than removing it. Estimated from typical
+tokenizer behaviour rather than measured here: prose runs about 4 characters per
+token and fits comfortably; code sits nearer 2.5-3, and log lines dense with
+timestamps, UUIDs and hex run 2-2.5. At those ratios a worst-case 2,000-character
+unit reaches roughly 800-1,000 tokens, so something like 60-75% of it survives
+the tokenizer. Overlap softens the loss — text cut from one unit's end usually
+reappears at the next unit's head — so this degrades recall on dense pastes
+rather than dropping content outright. Settling it means lowering `MAX_CHARS`,
+which changes document indexing and forces a `CHUNKER_VERSION` bump and a
+reindex. That is its own slice.
+
+**Overlap fragments waste searches.** On unbroken text with no line or paragraph
+boundaries — minified JSON, base64, a single enormous log line — `split_body`
+emits alternating sizes like `[2000, 2000, 202, 2000, 202, …]`, where the short
+units are overlap tails carried forward. Each still costs an embed and a search
+while repeating text the previous unit already covered. This is pre-existing
+behaviour in `split_body`, unchanged here, but it bites harder on queries: the
+cap makes each of the 8 searches a scarce slot, and a fragment spends one
+re-searching the previous unit's tail.
 
 ## Out of scope
 
