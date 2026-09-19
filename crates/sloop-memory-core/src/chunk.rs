@@ -5,7 +5,6 @@
 //! text, which gives both the vector and the BM25 side something to bite on when
 //! a chunk's body is mostly prose that never repeats the term.
 
-use crate::config;
 use std::collections::BTreeSet;
 
 /// Bumped whenever chunking changes. It is folded into each file's content hash,
@@ -227,18 +226,26 @@ fn split_body(body: &str) -> Vec<String> {
 /// case by a wide margin. Whitespace-only input yields no units; callers must
 /// reject empty queries, as the search paths do before reaching here.
 ///
-/// Above [`config::MAX_QUERY_UNITS`] the cap keeps the first
-/// `MAX_QUERY_UNITS - 1` units and the last one.
+/// Above `max_units` the cap keeps the first `max_units - 1` units and the
+/// last one.
+///
+/// The cap is a parameter, not a constant, because the two search paths have
+/// budgets three orders of magnitude apart: each unit costs an embed and a
+/// hybrid search, so the prompt hook passes
+/// [`crate::config::HOOK_MAX_QUERY_UNITS`] to stay inside its 250 ms, while
+/// the MCP path passes [`crate::config::MAX_QUERY_UNITS`] and has 30 seconds
+/// to spend. A `max_units` of zero still yields the tail unit: the tail is
+/// the one thing a cap must never drop.
 #[must_use]
-pub fn split_query(query: &str) -> Vec<String> {
+pub fn split_query(query: &str, max_units: usize) -> Vec<String> {
     let mut units = split_body(query);
-    if units.len() > config::MAX_QUERY_UNITS {
+    if units.len() > max_units {
         // Keep the last unit. Dropping it would reproduce at a higher
         // threshold the very failure this function removes: a pasted log
         // with the question underneath it, read from the boilerplate at
         // the top. The middle is what a paste can spare.
         let tail = units.remove(units.len() - 1);
-        units.truncate(config::MAX_QUERY_UNITS - 1);
+        units.truncate(max_units.saturating_sub(1));
         units.push(tail);
     }
     units
@@ -345,6 +352,7 @@ pub fn parse_note(title: &str, source: &str) -> ParsedNote {
 #[expect(clippy::unwrap_used, reason = "see comment above")]
 mod tests {
     use super::*;
+    use crate::config;
     use proptest::prelude::*;
     use std::fmt::Write as _;
 
@@ -429,11 +437,15 @@ mod tests {
     // same splitter. These pin what the search path depends on: a short query
     // stays one unit, a long one keeps its tail, nothing exceeds the chunk-size
     // bound, and the cap holds without throwing the tail away.
+    //
+    // Tests about the cap itself pass `config::MAX_QUERY_UNITS`, the MCP
+    // path's value; the rest pass it too, so the cap is never what they are
+    // measuring by accident.
 
     #[test]
     fn a_short_query_is_one_unit_unchanged() {
         assert_eq!(
-            split_query("how should the cache expire?"),
+            split_query("how should the cache expire?", config::MAX_QUERY_UNITS),
             vec!["how should the cache expire?".to_string()]
         );
     }
@@ -445,7 +457,7 @@ mod tests {
         let paste = "stack frame line\n".repeat(400);
         let query = format!("{paste}\nwhy does the cache never expire?");
 
-        let units = split_query(&query);
+        let units = split_query(&query, config::MAX_QUERY_UNITS);
 
         assert!(
             units.len() > 1,
@@ -463,7 +475,7 @@ mod tests {
     #[test]
     fn units_never_exceed_the_chunk_size_bound() {
         let query = "word ".repeat(20_000);
-        for unit in split_query(&query) {
+        for unit in split_query(&query, config::MAX_QUERY_UNITS) {
             assert!(
                 unit.chars().count() <= MAX_CHARS,
                 "unit of {} chars exceeds {MAX_CHARS}",
@@ -474,7 +486,10 @@ mod tests {
 
     #[test]
     fn a_whitespace_only_query_yields_no_units() {
-        assert_eq!(split_query("   \n\n  "), Vec::<String>::new());
+        assert_eq!(
+            split_query("   \n\n  ", config::MAX_QUERY_UNITS),
+            Vec::<String>::new()
+        );
     }
 
     /// The cap is live code. Without this, deleting the truncation changes no
@@ -483,7 +498,7 @@ mod tests {
     /// than the fixture's own size.
     #[test]
     fn a_very_long_query_is_capped() {
-        let units = split_query(&"word ".repeat(20_000));
+        let units = split_query(&"word ".repeat(20_000), config::MAX_QUERY_UNITS);
         assert_eq!(units.len(), config::MAX_QUERY_UNITS);
     }
 
@@ -495,7 +510,7 @@ mod tests {
         let paste = "stack frame line\n".repeat(3000);
         let query = format!("{paste}\nwhy does the cache never expire?");
 
-        let units = split_query(&query);
+        let units = split_query(&query, config::MAX_QUERY_UNITS);
 
         assert_eq!(units.len(), config::MAX_QUERY_UNITS);
         assert!(
@@ -504,6 +519,30 @@ mod tests {
                 .is_some_and(|u| u.contains("why does the cache never expire?")),
             "the cap dropped the question at the tail"
         );
+    }
+
+    /// The cap is a parameter because the hook and the MCP path have budgets
+    /// three orders of magnitude apart, and the hook's smaller one must buy
+    /// fewer units without buying back the dropped tail -- which is the
+    /// failure the head-plus-tail logic exists to prevent, and the property
+    /// most at risk from making the cap variable. Both caps run over the same
+    /// fixture, so a `split_query` that ignored its argument would fail on the
+    /// count and one that truncated plainly would fail on the tail.
+    #[test]
+    fn a_smaller_cap_is_honoured_and_still_keeps_the_tail() {
+        const QUESTION: &str = "why does the cache never expire?";
+        let paste = "stack frame line\n".repeat(3000);
+        let query = format!("{paste}\n{QUESTION}");
+
+        for max_units in [config::HOOK_MAX_QUERY_UNITS, config::MAX_QUERY_UNITS, 1] {
+            let units = split_query(&query, max_units);
+
+            assert_eq!(units.len(), max_units, "cap of {max_units} not honoured");
+            assert!(
+                units.last().is_some_and(|u| u.contains(QUESTION)),
+                "a cap of {max_units} dropped the question at the tail"
+            );
+        }
     }
 
     // ---- the size bound over arbitrary text ---------------------------------
@@ -561,7 +600,7 @@ mod tests {
         /// so a full-size unit can still be truncated downstream.
         #[test]
         fn every_unit_respects_the_chunk_size_bound(query in query()) {
-            let units = split_query(&query);
+            let units = split_query(&query, config::MAX_QUERY_UNITS);
 
             prop_assert!(
                 units.len() <= config::MAX_QUERY_UNITS,

@@ -111,6 +111,12 @@ fn best_k(mut hits: Vec<store::Hit>, k: usize) -> Vec<store::Hit> {
 /// chunk-size bound splits to one unit and takes exactly the path it did
 /// before.
 ///
+/// `max_units` is the caller's own budget: each unit costs an embed and a
+/// hybrid search, and the hook has 250 ms against the MCP path's 30 seconds.
+/// It goes into `split_query` rather than trimming the units here, because
+/// the split keeps the head *and the tail* and a trim afterwards would throw
+/// away the question this whole path exists to reach.
+///
 /// `search_one` is a parameter so the loop can be tested without a model or a
 /// table: the caller supplies the embed-and-search step, a test supplies a
 /// stub. It takes the unit by value because the future it returns outlives the
@@ -118,13 +124,17 @@ fn best_k(mut hits: Vec<store::Hit>, k: usize) -> Vec<store::Hit> {
 /// trait so that the embedder guard stays inside the caller's own statement --
 /// `clippy::await_holding_lock` is denied, and a guard passed across this
 /// boundary would be held across the search.
-async fn search_units<F, Fut>(query: &str, mut search_one: F) -> Result<Vec<store::Hit>>
+async fn search_units<F, Fut>(
+    query: &str,
+    max_units: usize,
+    mut search_one: F,
+) -> Result<Vec<store::Hit>>
 where
     F: FnMut(String) -> Fut,
     Fut: Future<Output = Result<Vec<store::Hit>>>,
 {
     let mut hits = Vec::new();
-    for unit in chunk::split_query(query) {
+    for unit in chunk::split_query(query, max_units) {
         hits.extend(search_one(unit).await?);
     }
     Ok(hits)
@@ -147,7 +157,7 @@ async fn recall(state: &State, prompt: &str) -> Result<RecallResult> {
     // `consolidate` reduces the concatenated hits to the best cosine per file,
     // so a note answering any part of a long query is a hit.
     let table = &table;
-    let hits = search_units(prompt, |unit| async move {
+    let hits = search_units(prompt, config::HOOK_MAX_QUERY_UNITS, |unit| async move {
         let qvec = { state.embedder.lock().await.encode_query(&unit)? };
         store::hybrid_search(table, qvec, &unit, config::HOOK_MAX_HITS * 4, None).await
     })
@@ -243,10 +253,13 @@ async fn dispatch(state: &State, req: Request) -> Response {
                     }
                 }
             };
-            // Same split as the hook path: MCP callers paste logs too. A unit
-            // that fails to embed or search fails the whole request rather
-            // than quietly returning the other units' hits -- a short answer
-            // is indistinguishable from a complete one to the caller.
+            // Same split as the hook path: MCP callers paste logs too. They
+            // get the larger unit cap, though -- `TOOL_TIMEOUT` is 30 seconds
+            // against the hook's 250 ms, so there is room to search more of a
+            // paste before the middle of it is dropped. A unit that fails to
+            // embed or search fails the whole request rather than quietly
+            // returning the other units' hits -- a short answer is
+            // indistinguishable from a complete one to the caller.
             //
             // An empty or whitespace-only query splits to no units at all and
             // so returns an empty hit list, not an error. That is the intended
@@ -258,7 +271,7 @@ async fn dispatch(state: &State, req: Request) -> Response {
             // will not have read either of them.
             let table = &table;
             let filter = filter.as_deref();
-            let searched = search_units(&query, |unit| async move {
+            let searched = search_units(&query, config::MAX_QUERY_UNITS, |unit| async move {
                 let qvec = { state.embedder.lock().await.encode_query(&unit)? };
                 store::hybrid_search(table, qvec, &unit, k, filter).await
             })
@@ -487,7 +500,7 @@ mod tests {
 
     use super::{best_k, consolidate, search_units, take_round_robin};
     use sloop_memory_core::proto::Pointer;
-    use sloop_memory_core::{chunk, store};
+    use sloop_memory_core::{chunk, config, store};
 
     fn hit(source_type: &str, rel_path: &str, heading: &str, cosine: f32) -> store::Hit {
         store::Hit {
@@ -702,12 +715,12 @@ mod tests {
         const QUESTION: &str = "why does the cache never expire?";
         let paste = "stack frame line\n".repeat(400);
         let query = format!("{paste}\n{QUESTION}");
-        let units = chunk::split_query(&query);
+        let units = chunk::split_query(&query, config::MAX_QUERY_UNITS);
         assert!(units.len() > 1, "the fixture query did not split");
 
         let searched = RefCell::new(Vec::new());
         let log = &searched;
-        let hits = search_units(&query, |unit| async move {
+        let hits = search_units(&query, config::MAX_QUERY_UNITS, |unit| async move {
             log.borrow_mut().push(unit.clone());
             // Only the tail carries the question, so only the tail matches.
             let matched = unit.contains(QUESTION);
@@ -746,7 +759,7 @@ mod tests {
         for query in ["", "   ", "\n\t\n"] {
             let calls = RefCell::new(0_usize);
             let seen = &calls;
-            let hits = search_units(query, |_unit| async move {
+            let hits = search_units(query, config::MAX_QUERY_UNITS, |_unit| async move {
                 *seen.borrow_mut() += 1;
                 anyhow::Ok(vec![hit("notes", "anything.md", "H", 0.99)])
             })
@@ -768,7 +781,7 @@ mod tests {
 
         let calls = RefCell::new(0_usize);
         let seen = &calls;
-        let result = search_units(&query, |_unit| async move {
+        let result = search_units(&query, config::MAX_QUERY_UNITS, |_unit| async move {
             *seen.borrow_mut() += 1;
             Err::<Vec<store::Hit>, _>(anyhow::anyhow!("embedder is wedged"))
         })
