@@ -106,15 +106,24 @@ one. Every figure here is on that basis — measured, 100,000 characters produce
 99 units.
 
 So a 28,341-character paste splits into roughly 28 units, and 28 searches to
-serve one prompt is too many. Units are capped at 8, about 8,000 characters of
-distinct query.
+serve one prompt is too many.
+
+The cap is per calling path, because the two paths have budgets three orders of
+magnitude apart. The MCP path takes `MAX_QUERY_UNITS` (8, about 8,000 characters
+of distinct query) against a 30-second `TOOL_TIMEOUT`. The prompt hook takes
+`HOOK_MAX_QUERY_UNITS` (5, about 5,000) against a 250 ms `HOOK_TIMEOUT`: each
+unit costs an embed and a search, and measured against a live daemon eight of
+them overrun that budget, so a single shared cap made the hook return nothing
+for exactly the large pastes this splitter exists to rescue. The cap is a
+parameter of `split_query` rather than a truncation applied afterwards, so that
+both paths keep the tail described below.
 
 Past that point more paste carries less intent, and the bound is stated rather
 than silent. That is the difference from today: truncation discards without
 saying so, while the cap discards a documented amount.
 
-The cap keeps the leading units **and the final one** — the first seven and the
-last, not the first eight. Taking units from the front alone would reproduce the
+The cap keeps the leading units **and the final one** — the first `n - 1` and
+the last, not the first `n`. Taking units from the front alone would reproduce the
 original failure at a higher threshold: a pasted log with the question typed
 underneath it would again be read entirely from the boilerplate at the top. The
 middle of a paste is what it can spare, because the question usually sits at the
@@ -131,7 +140,9 @@ passes after, so it is the test that carries the slice.
 
 A short query, asserting one unit and behaviour identical to today.
 
-A query above the cap, asserting the bound holds.
+A query above the cap, asserting the bound holds, and the same query under two
+different caps, asserting each is honoured and each still keeps the tail — the
+property most at risk from making the cap a parameter.
 
 A property: `split_query` never emits a unit longer than `MAX_CHARS`. The whole
 design rests on that invariant, and a property test covers inputs no example
@@ -139,7 +150,7 @@ would think to include.
 
 ## Known limitations
 
-Both are accepted for this slice, not solved by it.
+All four are accepted for this slice, not solved by it.
 
 **Residual truncation.** The bound is characters, the window is tokens, so
 splitting narrows the truncation rather than removing it. Estimated from typical
@@ -159,8 +170,48 @@ emits alternating sizes like `[2000, 2000, 202, 2000, 202, …]`, where the shor
 units are overlap tails carried forward. Each still costs an embed and a search
 while repeating text the previous unit already covered. This is pre-existing
 behaviour in `split_body`, unchanged here, but it bites harder on queries: the
-cap makes each of the 8 searches a scarce slot, and a fragment spends one
-re-searching the previous unit's tail.
+cap makes each search a scarce slot — five of them on the hook path — and a
+fragment spends one re-searching the previous unit's tail.
+
+**The tail unit dilutes on very large pastes.** Measured against a live scratch
+daemon on one machine, the fix holds to about 32 KB and degrades past it. A
+56,879-byte paste carrying its question on the last line came back at cosine
+0.7034, under the 0.75 gate, where a 32,329-byte paste ending in the identical
+question scored 0.8018.
+
+The cap is not the cause. That same 56 KB paste searched through the `Search`
+arm at `MAX_QUERY_UNITS` = 8 returns the identical 0.7034, so the extra units
+buy nothing. The cause is `split_body`'s packing remainder. The question always
+survives into the last unit, but it arrives with however much log the packer had
+in hand: 441 characters for the 32 KB paste (368 of log against the 73-character
+question) and 933 for the 56 KB one (860 against the same 73). The question is
+diluted roughly 2.3x further and the unit's vector moves with it. That remainder
+follows from wherever the line-packing loop happens to land, so it varies
+near-arbitrarily with total input length rather than degrading smoothly — a
+larger paste is not reliably worse, it is unpredictably so.
+
+None of this was observable before this slice. At eight units the hook exceeded
+`HOOK_TIMEOUT` and returned nothing at all, so the large pastes never produced a
+cosine to read. Shortening the tail unit means changing `split_body`, which
+documents share, so it carries the same reindex cost as the residual truncation
+above and is a separate slice on the same footing.
+
+**No test pins the per-path cap to its call site.** `split_query` honours
+whatever cap it is handed, and that is tested. Which constant each caller hands
+it is not: swapping `HOOK_MAX_QUERY_UNITS` and `MAX_QUERY_UNITS` between
+`recall` and the `Search` arm passes the whole suite. `recall` needs a live
+`State` — model, table and roots — so pinning the wiring needs an integration
+harness that does not exist yet.
+
+The latency table stands in as the weaker check. Every large paste on the hook
+path answered in 168-186 ms, measured on one machine; at the ~34 ms per unit
+that implies, eight units would cost about 275 ms and overrun the 250 ms budget.
+A hook that had silently reverted to eight would therefore time out and log
+`unavailable` instead of injecting, which the table would show. Per-unit cost
+measured about 48 ms on a second machine — the absolute figures travel poorly,
+but the ordering holds on both. This is evidence rather than a guarantee, and it
+only discriminates while `HOOK_TIMEOUT` stays near the cost of the cap: raise
+the budget or speed up the embedder and the measurement stops saying anything.
 
 ## Out of scope
 
