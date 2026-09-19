@@ -4,7 +4,7 @@
 //! ~3ms. Anything on the prompt path has to pay the former once, not per call.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -33,6 +33,55 @@ struct RecallResult {
     top_cosine: Option<f32>,
 }
 
+/// Reduce raw hits to one pointer per file, keeping the best cosine.
+///
+/// This is where a split query is put back together. Each unit is searched
+/// separately, and a chunk scores as the best it matched any one of them --
+/// max cosine, not RRF. RRF ranks well but is derived purely from rank
+/// (`store::Hit::score`), so `HOOK_MIN_COSINE` could not gate on it; cosine is
+/// calibrated and comparable across queries, which is exactly what merging
+/// across sub-queries needs.
+///
+/// Takes label/path pairs rather than `config::Roots` because a `config::Root`
+/// cannot be built outside `sloop-memory-core`, so a test would otherwise need
+/// the filesystem and the process environment to construct one. See
+/// `sloop-harness`'s `transcript_dir` for the same trade.
+fn consolidate(hits: Vec<store::Hit>, roots: &[(&str, &Path)]) -> Vec<Pointer> {
+    let mut best: Vec<Pointer> = Vec::new();
+    for h in hits
+        .into_iter()
+        .filter(|h| h.cosine >= config::HOOK_MIN_COSINE)
+    {
+        if let Some(existing) = best
+            .iter_mut()
+            .find(|p| p.source_type == h.source_type && p.rel_path == h.rel_path)
+        {
+            if h.cosine > existing.cosine {
+                existing.cosine = h.cosine;
+                existing.heading_path = h.heading_path;
+            }
+        } else {
+            let path = roots
+                .iter()
+                .find(|(label, _)| *label == h.source_type)
+                .map_or_else(
+                    || h.rel_path.clone(),
+                    |(_, dir)| dir.join(&h.rel_path).display().to_string(),
+                );
+            best.push(Pointer {
+                title: h.title,
+                source_type: h.source_type,
+                path,
+                rel_path: h.rel_path,
+                heading_path: h.heading_path,
+                captured: h.captured,
+                cosine: h.cosine,
+            });
+        }
+    }
+    best
+}
+
 async fn recall(state: &State, prompt: &str) -> Result<RecallResult> {
     if prompt.trim().is_empty() {
         return Ok(RecallResult {
@@ -51,39 +100,12 @@ async fn recall(state: &State, prompt: &str) -> Result<RecallResult> {
     let hits = store::hybrid_search(&table, qvec, prompt, config::HOOK_MAX_HITS * 4, None).await?;
     let top_cosine = hits.iter().map(|h| h.cosine).max_by(f32::total_cmp);
 
-    let mut best: Vec<Pointer> = Vec::new();
-    for h in hits
-        .into_iter()
-        .filter(|h| h.cosine >= config::HOOK_MIN_COSINE)
-    {
-        if let Some(existing) = best
-            .iter_mut()
-            .find(|p| p.source_type == h.source_type && p.rel_path == h.rel_path)
-        {
-            if h.cosine > existing.cosine {
-                existing.cosine = h.cosine;
-                existing.heading_path = h.heading_path;
-            }
-        } else {
-            let path = state
-                .roots
-                .iter()
-                .find(|root| root.label.as_str() == h.source_type)
-                .map_or_else(
-                    || h.rel_path.clone(),
-                    |root| root.dir.as_path().join(&h.rel_path).display().to_string(),
-                );
-            best.push(Pointer {
-                title: h.title,
-                source_type: h.source_type,
-                path,
-                rel_path: h.rel_path,
-                heading_path: h.heading_path,
-                captured: h.captured,
-                cosine: h.cosine,
-            });
-        }
-    }
+    let pairs: Vec<(&str, &Path)> = state
+        .roots
+        .iter()
+        .map(|root| (root.label.as_str(), root.dir.as_path()))
+        .collect();
+    let best = consolidate(hits, &pairs);
     Ok(RecallResult {
         pointers: take_round_robin(best, config::HOOK_MAX_HITS),
         top_cosine,
@@ -388,8 +410,22 @@ pub async fn serve() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::take_round_robin;
+    use super::{consolidate, take_round_robin};
     use sloop_memory_core::proto::Pointer;
+    use sloop_memory_core::store;
+
+    fn hit(source_type: &str, rel_path: &str, heading: &str, cosine: f32) -> store::Hit {
+        store::Hit {
+            score: 0.0,
+            cosine,
+            title: String::new(),
+            rel_path: rel_path.to_string(),
+            heading_path: heading.to_string(),
+            captured: String::new(),
+            source_type: source_type.to_string(),
+            text: String::new(),
+        }
+    }
 
     fn pointer(source_type: &str, cosine: f32) -> Pointer {
         Pointer {
@@ -520,5 +556,61 @@ mod tests {
     #[test]
     fn no_hits_yields_no_pointers() {
         assert_eq!(labelled(&take_round_robin(vec![], 3)), vec![]);
+    }
+
+    /// Two units matched the same file; the better match is the one that counts.
+    /// This is the merge a split query depends on.
+    #[test]
+    fn the_best_matching_unit_wins_for_a_file() {
+        let hits = vec![
+            hit("notes", "cache.md", "Turn 1", 0.76),
+            hit("notes", "cache.md", "Turn 9", 0.91),
+        ];
+
+        let out = consolidate(hits, &[]);
+
+        assert_eq!(out.len(), 1, "the same file produced two pointers");
+        assert!(
+            (out[0].cosine - 0.91).abs() < f32::EPSILON,
+            "kept {}",
+            out[0].cosine
+        );
+        assert_eq!(
+            out[0].heading_path, "Turn 9",
+            "kept the weaker unit's heading"
+        );
+    }
+
+    /// The max has to win on arrival order too. Units are searched in query
+    /// order, not score order, so the strongest match is as likely to land
+    /// first as last.
+    #[test]
+    fn the_best_matching_unit_wins_whichever_arrives_first() {
+        let hits = vec![
+            hit("notes", "cache.md", "Turn 9", 0.91),
+            hit("notes", "cache.md", "Turn 1", 0.76),
+        ];
+
+        let out = consolidate(hits, &[]);
+
+        assert_eq!(out.len(), 1, "the same file produced two pointers");
+        assert!(
+            (out[0].cosine - 0.91).abs() < f32::EPSILON,
+            "kept {}",
+            out[0].cosine
+        );
+        assert_eq!(
+            out[0].heading_path, "Turn 9",
+            "kept the weaker unit's heading"
+        );
+    }
+
+    /// A hit below the gate contributes nothing, even when another unit of the
+    /// same query cleared it. The threshold is per-chunk, not per-query.
+    #[test]
+    fn a_hit_below_the_gate_is_dropped() {
+        let hits = vec![hit("notes", "unrelated.md", "H", 0.40)];
+
+        assert!(consolidate(hits, &[]).is_empty());
     }
 }
