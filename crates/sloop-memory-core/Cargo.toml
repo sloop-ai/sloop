@@ -40,3 +40,7 @@ chrono = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
+# The unit-size bound is a property over arbitrary text, and the inputs that
+# break splitters -- no blank lines, one enormous line, lone newlines -- are
+# exactly the ones an example test omits. sloop-harness already uses proptest.
+proptest = "1"

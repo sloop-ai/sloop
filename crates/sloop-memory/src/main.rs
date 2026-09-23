@@ -106,19 +106,35 @@ fn hook_context() -> Option<String> {
         return None;
     }
 
+    // Measured here rather than taken from the response, because the case
+    // worth seeing is the one where there is no response: an `unavailable`
+    // line sitting at HOOK_TIMEOUT is a daemon too slow for this prompt, one
+    // at a couple of milliseconds is a daemon that is not running.
+    let started = std::time::Instant::now();
     let response = client::request(
         &Request::Recall {
             prompt: prompt.clone(),
         },
         HOOK_TIMEOUT,
-    )
-    .ok()?;
-    let Response::Pointers {
+    );
+    // u64::MAX ms is ~584 million years, and this call is bounded by
+    // HOOK_TIMEOUT regardless.
+    #[expect(clippy::cast_possible_truncation, reason = "see comment above")]
+    let round_trip_ms = started.elapsed().as_millis() as u64;
+
+    let Ok(Response::Pointers {
         pointers,
         elapsed_ms,
         top_cosine,
-    } = response
+    }) = response
     else {
+        // Still fail-open -- no pointers, exit 0 -- but no longer silent. The
+        // injection log exists so that a hook misbehaving in front of the
+        // user's turn is detectable after the fact, and a timeout that wrote
+        // nothing at all was indistinguishable from a hook that never ran.
+        // Distinct from "miss": the daemon did not answer, so nothing was
+        // searched and there is no cosine to report.
+        let _ = log_recall(&prompt, "unavailable", &[], None, round_trip_ms);
         return None;
     };
     let outcome = if pointers.is_empty() {

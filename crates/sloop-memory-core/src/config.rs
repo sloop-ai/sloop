@@ -39,6 +39,27 @@ pub const HOOK_MAX_HITS: usize = 3;
 /// near 0.3.
 pub const HOOK_MIN_COSINE: f32 = 0.75;
 
+/// How many units a long query searches before the middle of it is dropped.
+///
+/// A unit advances `chunk::TARGET_CHARS` less `chunk::OVERLAP_CHARS` of new
+/// text, since each split carries its predecessor's tail forward -- so eight
+/// is roughly 8,000 characters of distinct query at today's values. Past that
+/// a paste carries less intent than the searches cost: measured over 220 real
+/// prompts the median is 80 characters and 92% need no splitting at all.
+/// Unlike the tokenizer's truncation this bound is stated rather than silent.
+///
+/// This is the cap for a caller with room to spend it -- the MCP path, whose
+/// budget is 30 seconds. The prompt hook takes [`HOOK_MAX_QUERY_UNITS`].
+pub const MAX_QUERY_UNITS: usize = 8;
+
+/// The unit cap for the prompt hook, which answers inside `HOOK_TIMEOUT`.
+///
+/// Measured against a live daemon: five units answered in 205 ms and seven
+/// timed out, against a 250 ms budget. The hook sits in front of the user's
+/// turn, so it takes the smaller cap; `MAX_QUERY_UNITS` still applies on the
+/// MCP path, which has a 30-second budget.
+pub const HOOK_MAX_QUERY_UNITS: usize = 5;
+
 fn env_path(key: &str) -> Option<PathBuf> {
     std::env::var_os(key).map(PathBuf::from)
 }
