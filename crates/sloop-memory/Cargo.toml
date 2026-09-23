@@ -14,7 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 sloop-memory-core.workspace = true
-lancedb = "0.37"
+lancedb = "0.38"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "signal", "time"] }
 clap = { version = "4", features = ["derive"] }
 serde_json = "1"
