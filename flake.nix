@@ -90,7 +90,7 @@
             # It validates the vendor derivation's own output hash and passes
             # while the package build is broken. Only the full package build
             # runs the hook that compares the two lock files.
-            cargoHash = "sha256-RyWjP4+NPiIrvOscAM+vOcuz2+X4nXwBgH4WOr/0jqA=";
+            cargoHash = "sha256-k/tZJb1rJotgcq2gUE5UBtf2MvhD3IirxY6Aq3iRQ2I=";
             cargoBuildFlags = [ "-p" "sloop-memory" ];
 
             # protoc is build-time codegen for lance-encoding's .proto files,
