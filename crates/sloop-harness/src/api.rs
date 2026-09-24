@@ -499,18 +499,6 @@ mod tests {
             body["tool_choice"],
             serde_json::json!({ "type": "tool", "name": "a_fixture_tool" })
         );
-        // The whole object rather than its `name`. A projection pins only the
-        // field it reads: with `assert_eq!(body["tools"][0]["name"], ..)` here,
-        // renaming the `description` field to `desc` left all 118 tests green,
-        // and the first thing to notice would have been a 400.
-        assert_eq!(
-            body["tools"][0],
-            serde_json::json!({
-                "name": "a_fixture_tool",
-                "description": "Stands in for a tool. Never call it; nothing answers.",
-                "input_schema": { "type": "object", "properties": { "q": { "type": "string" } } }
-            })
-        );
     }
 
     // `Auto` was the last arm nothing spelled out, and it is the one the demo
@@ -526,30 +514,34 @@ mod tests {
         assert_eq!(body["tool_choice"], serde_json::json!({ "type": "auto" }));
     }
 
-    // The claim that the schema travels as an object rather than as the string
-    // it is stored in -- the whole risk of holding it as JSON text. A field
-    // serialized plainly would read `"{\"type\": \"object\"...}"` here, which
-    // the API rejects, and the assertion above on `name` would not notice.
+    // The whole object, not a field of it. Two things hide behind a
+    // projection: `assert_eq!(body["tools"][0]["name"], ..)` left the suite
+    // green while `description` was renamed to `desc`, and it would say
+    // nothing about `input_schema` arriving as the string it is stored in
+    // rather than as JSON -- which is the standing risk of holding a schema
+    // as text, and a 400 from the far end when it happens.
     #[test]
-    fn a_tools_schema_travels_as_json_rather_than_as_a_string() {
+    fn a_tool_definition_has_the_shape_the_api_expects() {
         let tree = Tree::new(ContentBlock::text("hi"));
         let messages = tree.prompt_for(tree.root()).unwrap();
         let tools = [A_FIXTURE_TOOL];
         let body = serde_json::to_value(Request::new(&messages, &tools, ToolChoice::Auto)).unwrap();
 
         assert_eq!(
-            body["tools"][0]["input_schema"],
-            serde_json::json!({ "type": "object", "properties": { "q": { "type": "string" } } })
+            body["tools"][0],
+            serde_json::json!({
+                "name": "a_fixture_tool",
+                "description": "Stands in for a tool. Never call it; nothing answers.",
+                "input_schema": { "type": "object", "properties": { "q": { "type": "string" } } }
+            })
         );
     }
 
-    // Do not delete this as redundant. The pairing it appears to check is
-    // already covered -- a `new` that dropped the choice fails the forced-tool
-    // test above as well as this one -- but this is the only place that
-    // constructs `ToolChoice::None`, and the suppression on that variant is
-    // `not(test)`. Under cfg(test) `dead_code` applies normally, so removing
-    // this turns the variant into a clippy failure at its declaration, which
-    // is an obscure thing to meet while tidying a test module.
+    // Also the only place that constructs `ToolChoice::None`, whose
+    // suppression is `not(test)`: under cfg(test) `dead_code` applies
+    // normally, so deleting this test turns the variant into a clippy failure
+    // at its declaration -- an obscure thing to meet while tidying a test
+    // module.
     #[test]
     fn a_forbidden_choice_spells_itself_none() {
         let tree = Tree::new(ContentBlock::text("hi"));
