@@ -512,9 +512,17 @@ mod tests {
         );
     }
 
-    // The other half of the pairing rule. Without this, a `new` that always
-    // wrote `None` would pass the no-tools test above and send `tools` with no
-    // `tool_choice` -- legal, but not what the caller asked for.
+    // Do not delete this as redundant. The pairing it appears to check is
+    // already covered -- a `new` that dropped the choice fails the forced-tool
+    // test above as well as this one -- but this is the only place that
+    // constructs `ToolChoice::None`, and the suppression on that variant is
+    // `not(test)`. Under cfg(test) `dead_code` applies normally, so removing
+    // this turns the variant into a clippy failure at its declaration, which
+    // is an obscure thing to meet while tidying a test module.
+    //
+    // What it does pin on its own is the spelling: `none` is the one arm
+    // nothing else here sends, so a rename or a changed tag would otherwise
+    // reach the API before it reached a test.
     #[test]
     fn declaring_a_tool_carries_the_choice_with_it() {
         let tree = Tree::new(ContentBlock::text("hi"));
