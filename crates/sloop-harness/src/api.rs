@@ -108,7 +108,14 @@ pub enum ToolChoice {
     // Both go live together. The scripted turn that forces a call with `Tool`
     // is followed by one that forbids a call with `None`, which is what makes
     // the second turn terminal text rather than a third request. Neither
-    // attribute expires on its own, so that task deletes both by hand.
+    // attribute has to be remembered: constructing a variant expires its
+    // expectation, so the build fails here with
+    // `unfulfilled_lint_expectations` naming the line to delete. That error
+    // is the instruction, not something to suppress.
+    //
+    // Construction is what does it, and only construction. A `match` arm
+    // reads a variant without building one, so `dead_code` goes on firing and
+    // the expectation stays fulfilled -- adding one here buys no warning.
     #[cfg_attr(not(test), expect(dead_code, reason = "see above"))]
     None,
     #[cfg_attr(not(test), expect(dead_code, reason = "see above"))]
@@ -492,7 +499,31 @@ mod tests {
             body["tool_choice"],
             serde_json::json!({ "type": "tool", "name": "a_fixture_tool" })
         );
-        assert_eq!(body["tools"][0]["name"], "a_fixture_tool");
+        // The whole object rather than its `name`. A projection pins only the
+        // field it reads: with `assert_eq!(body["tools"][0]["name"], ..)` here,
+        // renaming the `description` field to `desc` left all 118 tests green,
+        // and the first thing to notice would have been a 400.
+        assert_eq!(
+            body["tools"][0],
+            serde_json::json!({
+                "name": "a_fixture_tool",
+                "description": "Stands in for a tool. Never call it; nothing answers.",
+                "input_schema": { "type": "object", "properties": { "q": { "type": "string" } } }
+            })
+        );
+    }
+
+    // `Auto` was the last arm nothing spelled out, and it is the one the demo
+    // actually sends: giving it `#[serde(rename = "always")]` left the suite
+    // green. The other two are pinned by the tests around this one.
+    #[test]
+    fn an_auto_choice_spells_itself_auto() {
+        let tree = Tree::new(ContentBlock::text("hi"));
+        let messages = tree.prompt_for(tree.root()).unwrap();
+        let tools = [A_FIXTURE_TOOL];
+        let body = serde_json::to_value(Request::new(&messages, &tools, ToolChoice::Auto)).unwrap();
+
+        assert_eq!(body["tool_choice"], serde_json::json!({ "type": "auto" }));
     }
 
     // The claim that the schema travels as an object rather than as the string
@@ -519,12 +550,8 @@ mod tests {
     // `not(test)`. Under cfg(test) `dead_code` applies normally, so removing
     // this turns the variant into a clippy failure at its declaration, which
     // is an obscure thing to meet while tidying a test module.
-    //
-    // What it does pin on its own is the spelling: `none` is the one arm
-    // nothing else here sends, so a rename or a changed tag would otherwise
-    // reach the API before it reached a test.
     #[test]
-    fn declaring_a_tool_carries_the_choice_with_it() {
+    fn a_forbidden_choice_spells_itself_none() {
         let tree = Tree::new(ContentBlock::text("hi"));
         let messages = tree.prompt_for(tree.root()).unwrap();
         let tools = [A_FIXTURE_TOOL];

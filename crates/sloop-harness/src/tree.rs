@@ -66,9 +66,15 @@ pub enum ContentBlock {
     // Nothing outside the tests builds one yet: the decoder that will is the
     // next piece of work. Hence not(test) -- under cfg(test) the variant is
     // constructed and an expectation that held there would go unfulfilled.
-    // Unlike the constructor's attribute below, this one will not expire on
-    // its own: expect(dead_code) self-cleans on a function but stays silent on
-    // a variant that becomes live. Task 3 step 3b deletes it by name.
+    // Task 3's decoder builds the first one outside them, and that expires
+    // this attribute: the build fails here with
+    // `unfulfilled_lint_expectations` naming the line to delete, which is the
+    // instruction rather than an error to suppress.
+    //
+    // Construction is what expires it, and only construction. `text_of`
+    // already matches on this variant and that changes nothing -- a match arm
+    // reads one without building one, so `dead_code` goes on firing and the
+    // expectation stays fulfilled.
     #[cfg_attr(not(test), expect(dead_code, reason = "see above"))]
     ToolUse {
         id: String,
@@ -79,8 +85,8 @@ pub enum ContentBlock {
     /// The answer to one call. A user block, though nothing in the type says
     /// so -- role lives on the node, and the validity rule is what enforces it.
     // Built by the tool loop, which does not exist yet. See `ToolUse` above
-    // for why the attribute is conditional and why it cannot expire on its
-    // own. Task 9 is the one that deletes this copy by name.
+    // for why the attribute is conditional and how it announces its own
+    // deletion. Task 9's `Tools::run` constructs the first one of these.
     #[cfg_attr(not(test), expect(dead_code, reason = "see above"))]
     ToolResult {
         tool_use_id: String,
@@ -100,8 +106,12 @@ pub enum ContentBlock {
 /// `from_string` re-parses rather than trusting the caller, which is what
 /// keeps a malformed input from tearing a hole in a body the API would then
 /// reject for reasons of its own. What comes back is the parser's own error
-/// -- "EOF while parsing an object at line 1 column 1" and the like -- and it
-/// names neither the block nor the tool, so the turn is the unit to look at.
+/// -- "EOF while parsing an object at line 1 column 1" and the like -- naming
+/// neither caller, and which one it was decides where to look. A malformed
+/// `ToolUse::input` arrived from the model, so the turn is the unit to
+/// inspect and asking again may simply work. A malformed `input_schema` is a
+/// `const` in this source: it fails every request identically until someone
+/// edits it, and no turn is at fault.
 ///
 /// `pub(crate)` rather than private: a tool's input schema is held as JSON
 /// text for the same reason a call's input is, and the two want one writer.
