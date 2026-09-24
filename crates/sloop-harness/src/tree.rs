@@ -103,8 +103,14 @@ pub enum ContentBlock {
 /// -- "EOF while parsing an object at line 1 column 1" and the like -- and it
 /// names neither the block nor the tool, so the turn is the unit to look at.
 ///
+/// `pub(crate)` rather than private: a tool's input schema is held as JSON
+/// text for the same reason a call's input is, and the two want one writer.
+///
 /// [`RawValue`]: serde_json::value::RawValue
-fn serialize_raw_json<S: serde::Serializer>(json: &str, serializer: S) -> Result<S::Ok, S::Error> {
+pub(crate) fn serialize_raw_json<S: serde::Serializer>(
+    json: &str,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
     let raw = serde_json::value::RawValue::from_string(json.to_owned())
         .map_err(serde::ser::Error::custom)?;
     raw.serialize(serializer)

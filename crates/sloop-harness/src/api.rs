@@ -18,7 +18,7 @@ use serde::Serialize;
 
 use crate::api::accumulate::Accumulator;
 use crate::api::sse::{data_of, FrameDecoder};
-use crate::tree::{ContentBlock, Message};
+use crate::tree::{serialize_raw_json, ContentBlock, Message};
 
 const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
 
@@ -48,6 +48,70 @@ struct Request<'a> {
     // Borrowed rather than owned because the tree already holds the only copy
     // and a request outlives nothing: it is serialized and dropped.
     messages: &'a [Message],
+    // Both skipped when empty, and only ever empty together -- see
+    // `Request::new`. `tool_choice` alone is a 400, and `tools` alone would be
+    // the caller silently getting a choice it did not name.
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    tools: &'a [ToolDefinition],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<ToolChoice>,
+}
+
+/// One tool, as `/v1/messages` wants it described.
+///
+/// A `const` rather than anything built at runtime, which is what fixes the
+/// field types: `&'static str` throughout, and `Copy` so a slice of these can
+/// be handed around without a lifetime of its own.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct ToolDefinition {
+    pub name: &'static str,
+    /// Prescriptive about *when* to call it, not only what it does -- the
+    /// description is the only thing steering the model's should-call
+    /// decision, and recent models reach for tools conservatively.
+    pub description: &'static str,
+    /// The schema's JSON text, written through unchanged.
+    ///
+    /// Text rather than a `serde_json::Value` built at each call, and text
+    /// rather than the `fn() -> Value` this field was first drawn as: a
+    /// function pointer has no `Serialize`, so that shape does not compile,
+    /// and routing it through `serialize_with` would only be a `const` schema
+    /// pretending to be computed. An owned `Value` would cost the `const` and
+    /// the `Copy` with it, for a schema that is a literal in the source
+    /// either way.
+    ///
+    /// The tradeoff is the one [`ContentBlock::ToolUse`]'s `input` already
+    /// takes: nothing checks the text until it is serialized. `from_string`
+    /// re-parses there, so a malformed schema fails the request rather than
+    /// corrupting it -- but a well-formed non-object still reaches the API
+    /// and comes back as a 400.
+    ///
+    /// [`ContentBlock::ToolUse`]: crate::tree::ContentBlock::ToolUse
+    #[serde(serialize_with = "serialize_raw_json")]
+    pub input_schema: &'static str,
+}
+
+/// Whether the model may call a tool, must, or must not.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolChoice {
+    Auto,
+    // Nothing outside the tests names either of the two below yet: the demo
+    // sends `Auto` and goes on doing so until it starts calling tools. Hence
+    // not(test), matching the tree's unbuilt variants -- under cfg(test) they
+    // are constructed and an expectation that held there would itself go
+    // unfulfilled. Neither attribute expires on its own, so whichever task
+    // first forces or forbids a call deletes the one it makes live.
+    //
+    // `None` is the arm with no task waiting for it. It is here because the
+    // three together are what "may, must, must not" means, and an enum that
+    // could not say the third would send `tools` with no way to stop the
+    // model reaching for them.
+    #[cfg_attr(not(test), expect(dead_code, reason = "see above"))]
+    None,
+    #[cfg_attr(not(test), expect(dead_code, reason = "see above"))]
+    Tool {
+        name: &'static str,
+    },
 }
 
 /// `budget_tokens` is absent because it is a 400 on this model.
@@ -63,7 +127,7 @@ struct Thinking {
 }
 
 impl<'a> Request<'a> {
-    fn new(messages: &'a [Message]) -> Self {
+    fn new(messages: &'a [Message], tools: &'a [ToolDefinition], choice: ToolChoice) -> Self {
         Self {
             model: MODEL,
             max_tokens: MAX_TOKENS,
@@ -73,6 +137,11 @@ impl<'a> Request<'a> {
                 display: "summarized",
             },
             messages,
+            tools,
+            // The choice is dropped rather than refused when there are no
+            // tools, because "send nothing about tools" is the only thing a
+            // caller can mean by an empty slice, whatever it passed here.
+            tool_choice: (!tools.is_empty()).then_some(choice),
         }
     }
 }
@@ -167,6 +236,11 @@ impl Api {
     /// meet without a conversion, which is the reason this function knows
     /// nothing about trees, tips or status labels.
     ///
+    /// `tools` and `choice` are per-request rather than per-client: what the
+    /// model may reach for is a property of the turn being asked for, not of
+    /// the credential. An empty `tools` sends neither field and `choice` is
+    /// then ignored.
+    ///
     /// `on_block` sees each block as it completes. Nothing here reports
     /// partial blocks: the tree only ever accepts whole ones, so a caller that
     /// wants a token at a time would be asking for something the tree cannot
@@ -184,6 +258,8 @@ impl Api {
     pub async fn send(
         &self,
         messages: &[Message],
+        tools: &[ToolDefinition],
+        choice: ToolChoice,
         mut on_block: impl FnMut(&ContentBlock) -> Result<()>,
     ) -> Result<Turn> {
         let response = self
@@ -191,7 +267,7 @@ impl Api {
             .post(MESSAGES_URL)
             .header("x-api-key", self.key_header()?)
             .header("anthropic-version", ANTHROPIC_VERSION)
-            .json(&Request::new(messages))
+            .json(&Request::new(messages, tools, choice))
             .send()
             .await
             .context("POST /v1/messages")?;
@@ -273,8 +349,17 @@ impl Api {
     reason = "a test reports failure by panicking, and an unwrap is one way"
 )]
 mod tests {
-    use super::{Api, Request};
+    use super::{Api, Request, ToolChoice, ToolDefinition};
     use crate::tree::{ContentBlock, Tree};
+
+    // Not the real tool. `search_memory` arrives with the thing that executes
+    // it, and a test that named it here would pass whether or not that tool
+    // ever existed, while reading as though it had checked.
+    const A_FIXTURE_TOOL: ToolDefinition = ToolDefinition {
+        name: "a_fixture_tool",
+        description: "Stands in for a tool. Never call it; nothing answers.",
+        input_schema: r#"{"type": "object", "properties": {"q": {"type": "string"}}}"#,
+    };
 
     // Both of these deliberately avoid the process environment: that is global
     // mutable state the whole test binary shares.
@@ -352,7 +437,7 @@ mod tests {
         let messages = tree.prompt_for(tree.root()).unwrap();
 
         assert_eq!(
-            serde_json::to_value(Request::new(&messages)).unwrap(),
+            serde_json::to_value(Request::new(&messages, &[], ToolChoice::Auto)).unwrap(),
             serde_json::json!({
                 "model": "claude-opus-5",
                 "max_tokens": 64000,
@@ -369,9 +454,71 @@ mod tests {
         // value we would name. Both absences are deliberate.
         let tree = Tree::new(ContentBlock::text("hi"));
         let messages = tree.prompt_for(tree.root()).unwrap();
-        let body = serde_json::to_string(&Request::new(&messages)).unwrap();
+        let body = serde_json::to_string(&Request::new(&messages, &[], ToolChoice::Auto)).unwrap();
 
         assert!(!body.contains("budget_tokens"));
         assert!(!body.contains("output_config"));
+    }
+
+    #[test]
+    fn a_request_with_no_tools_names_neither_field() {
+        let tree = Tree::new(ContentBlock::text("hi"));
+        let messages = tree.prompt_for(tree.root()).unwrap();
+        let body = serde_json::to_string(&Request::new(&messages, &[], ToolChoice::Auto)).unwrap();
+
+        // `tool_choice` without `tools` is a 400, so neither may appear alone.
+        assert!(!body.contains("tools"), "{body}");
+        assert!(!body.contains("tool_choice"), "{body}");
+    }
+
+    #[test]
+    fn a_forced_tool_choice_names_the_tool() {
+        let tree = Tree::new(ContentBlock::text("hi"));
+        let messages = tree.prompt_for(tree.root()).unwrap();
+        let tools = [A_FIXTURE_TOOL];
+        let body = serde_json::to_value(Request::new(
+            &messages,
+            &tools,
+            ToolChoice::Tool {
+                name: "a_fixture_tool",
+            },
+        ))
+        .unwrap();
+
+        assert_eq!(
+            body["tool_choice"],
+            serde_json::json!({ "type": "tool", "name": "a_fixture_tool" })
+        );
+        assert_eq!(body["tools"][0]["name"], "a_fixture_tool");
+    }
+
+    // The claim that the schema travels as an object rather than as the string
+    // it is stored in -- the whole risk of holding it as JSON text. A field
+    // serialized plainly would read `"{\"type\": \"object\"...}"` here, which
+    // the API rejects, and the assertion above on `name` would not notice.
+    #[test]
+    fn a_tools_schema_travels_as_json_rather_than_as_a_string() {
+        let tree = Tree::new(ContentBlock::text("hi"));
+        let messages = tree.prompt_for(tree.root()).unwrap();
+        let tools = [A_FIXTURE_TOOL];
+        let body = serde_json::to_value(Request::new(&messages, &tools, ToolChoice::Auto)).unwrap();
+
+        assert_eq!(
+            body["tools"][0]["input_schema"],
+            serde_json::json!({ "type": "object", "properties": { "q": { "type": "string" } } })
+        );
+    }
+
+    // The other half of the pairing rule. Without this, a `new` that always
+    // wrote `None` would pass the no-tools test above and send `tools` with no
+    // `tool_choice` -- legal, but not what the caller asked for.
+    #[test]
+    fn declaring_a_tool_carries_the_choice_with_it() {
+        let tree = Tree::new(ContentBlock::text("hi"));
+        let messages = tree.prompt_for(tree.root()).unwrap();
+        let tools = [A_FIXTURE_TOOL];
+        let body = serde_json::to_value(Request::new(&messages, &tools, ToolChoice::None)).unwrap();
+
+        assert_eq!(body["tool_choice"], serde_json::json!({ "type": "none" }));
     }
 }

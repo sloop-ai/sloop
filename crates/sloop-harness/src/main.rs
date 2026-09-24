@@ -24,7 +24,7 @@ mod api;
 mod transcript;
 mod tree;
 
-use api::{Api, Turn};
+use api::{Api, ToolChoice, Turn};
 use tree::{ContentBlock, NodeId, Role, Status, Tree};
 
 /// What the demo asks when the command line says nothing. Short on purpose:
@@ -189,7 +189,13 @@ async fn main() -> Result<()> {
 /// complete.
 async fn turn(api: &Api, tree: &Tree, tip: NodeId) -> Result<Turn> {
     let prompt = tree.prompt_for(tip).ok_or_else(rejected_id)?;
-    api.send(&prompt, |block| line(&summarize(block))).await
+    // No tools yet. The demo is about forking a turn, and a tool call in the
+    // middle of one would be a second thing to explain; it declares a tool
+    // once there is something on the other end to answer with.
+    api.send(&prompt, &[], ToolChoice::Auto, |block| {
+        line(&summarize(block))
+    })
+    .await
 }
 
 /// Append a whole turn under `parent`, returning the node ids in order.
