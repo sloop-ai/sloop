@@ -10,7 +10,10 @@ sloop-memory-core.workspace = true
 # Replay emits the /v1/messages content shape -- {"type": "text", ...} -- so the
 # wire format lives in the types rather than in a hand-written serializer.
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# raw_value keeps a tool call's input as the bytes the model produced. Parsing
+# and reserializing would rewrite key order and escaping in a block that has to
+# travel back in every later request.
+serde_json = { version = "1", features = ["raw_value"] }
 # There is no official Anthropic SDK for Rust, so this talks raw HTTP. reqwest,
 # hyper, rustls and ring are already in the lock file by way of the lance tree,
 # so taking reqwest directly adds no crate and no license that is not already

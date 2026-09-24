@@ -31,11 +31,13 @@ pub enum Role {
 
 /// One content block, serialized in the shape `/v1/messages` expects.
 ///
-/// `tool_use` and `tool_result` are still absent; they arrive with the slice
-/// that has tools to call. `thinking` is here because there is no request
-/// shape that avoids it: thinking is on by default on the model this crate
-/// talks to, so a response contains one whether or not the caller asked.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// `thinking` is here because there is no request shape that avoids it:
+/// thinking is on by default on the model this crate talks to, so a response
+/// contains one whether or not the caller asked.
+///
+/// Only `Serialize` is derived. [`WireBlock`] carries the reason the other
+/// half cannot be.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
     Text {
@@ -48,6 +50,90 @@ pub enum ContentBlock {
         thinking: String,
         signature: String,
     },
+    /// A call the model wants made.
+    ///
+    /// `input` is the JSON text the deltas delivered, kept verbatim for the
+    /// reason `signature` is: this block travels back in every later request,
+    /// and parsing then reserializing rewrites key order, escaping and number
+    /// formatting in bytes the model produced. It is parsed at execution time,
+    /// from a copy.
+    ToolUse {
+        id: String,
+        name: String,
+        #[serde(serialize_with = "serialize_raw_json")]
+        input: String,
+    },
+    /// The answer to one call. A user block, though nothing in the type says
+    /// so -- role lives on the node, and the validity rule is what enforces it.
+    ToolResult {
+        tool_use_id: String,
+        content: String,
+        is_error: bool,
+    },
+}
+
+/// Emit the stored JSON text as JSON rather than as a quoted string.
+fn serialize_raw_json<S: serde::Serializer>(json: &str, serializer: S) -> Result<S::Ok, S::Error> {
+    let raw = serde_json::value::RawValue::from_string(json.to_owned())
+        .map_err(serde::ser::Error::custom)?;
+    raw.serialize(serializer)
+}
+
+/// Every field of every variant, all optional, with nothing chosen yet.
+///
+/// [`ContentBlock`] cannot derive `Deserialize`, and `input` is why. Serde's
+/// internally tagged representation buffers the whole map into a value of its
+/// own before it reads the tag and picks a variant, and that buffer is no
+/// longer JSON text: `RawValue` deserializes only straight from `serde_json`'s
+/// deserializer and rejects the buffer with "invalid type: newtype struct".
+/// A plain struct is not buffered, so `input` arrives here as the bytes that
+/// were on the wire -- which is the whole point of keeping it as text.
+#[derive(Deserialize)]
+struct WireBlock {
+    #[serde(rename = "type")]
+    kind: String,
+    text: Option<String>,
+    thinking: Option<String>,
+    signature: Option<String>,
+    id: Option<String>,
+    name: Option<String>,
+    input: Option<Box<serde_json::value::RawValue>>,
+    tool_use_id: Option<String>,
+    content: Option<String>,
+    is_error: Option<bool>,
+}
+
+/// A field the tag promised, or the error naming the one that is missing.
+fn required<T, E: serde::de::Error>(field: Option<T>, kind: &str, name: &str) -> Result<T, E> {
+    field.ok_or_else(|| E::custom(format!("a {kind} block has no {name}")))
+}
+
+impl<'de> Deserialize<'de> for ContentBlock {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = WireBlock::deserialize(deserializer)?;
+        match wire.kind.as_str() {
+            "text" => Ok(Self::Text {
+                text: required(wire.text, "text", "text")?,
+            }),
+            "thinking" => Ok(Self::Thinking {
+                thinking: required(wire.thinking, "thinking", "thinking")?,
+                signature: required(wire.signature, "thinking", "signature")?,
+            }),
+            "tool_use" => Ok(Self::ToolUse {
+                id: required(wire.id, "tool_use", "id")?,
+                name: required(wire.name, "tool_use", "name")?,
+                input: required(wire.input, "tool_use", "input")?.get().to_owned(),
+            }),
+            "tool_result" => Ok(Self::ToolResult {
+                tool_use_id: required(wire.tool_use_id, "tool_result", "tool_use_id")?,
+                content: required(wire.content, "tool_result", "content")?,
+                is_error: required(wire.is_error, "tool_result", "is_error")?,
+            }),
+            other => Err(serde::de::Error::custom(format!(
+                "unknown content block type `{other}`"
+            ))),
+        }
+    }
 }
 
 impl ContentBlock {
@@ -357,6 +443,8 @@ mod tests {
                         thinking,
                         signature: _,
                     } => thinking,
+                    ContentBlock::ToolUse { name, .. } => name,
+                    ContentBlock::ToolResult { content, .. } => content,
                 };
                 out.push(text.clone());
             }
@@ -505,6 +593,104 @@ mod tests {
 
         let block: ContentBlock = serde_json::from_str(wire).unwrap();
         assert_eq!(serde_json::to_string(&block).unwrap(), wire);
+    }
+
+    #[test]
+    fn a_tool_call_serializes_its_input_as_an_object() {
+        let block = ContentBlock::ToolUse {
+            id: "toolu_01A".to_owned(),
+            name: "search_memory".to_owned(),
+            input: r#"{"query":"cache expiry"}"#.to_owned(),
+        };
+
+        assert_eq!(
+            serde_json::to_value(&block).unwrap(),
+            serde_json::json!({
+                "type": "tool_use",
+                "id": "toolu_01A",
+                "name": "search_memory",
+                "input": { "query": "cache expiry" }
+            })
+        );
+    }
+
+    // The bytes, not the parse. A round trip that compared parsed values would
+    // pass against an implementation that reorders keys, and reordering is the
+    // one thing keeping the raw string exists to prevent.
+    #[test]
+    #[expect(
+        clippy::panic,
+        reason = "the let-else has no value to assert on; the panic is the failure"
+    )]
+    fn a_tool_call_input_survives_a_round_trip_byte_for_byte() {
+        let input = r#"{"z":1,"a":{"nested":"  spaced  "}}"#;
+        let block = ContentBlock::ToolUse {
+            id: "toolu_01A".to_owned(),
+            name: "search_memory".to_owned(),
+            input: input.to_owned(),
+        };
+
+        let json = serde_json::to_string(&block).unwrap();
+        let back: ContentBlock = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(back, block);
+        let ContentBlock::ToolUse { input: round, .. } = back else {
+            panic!("a tool call deserialized as something else");
+        };
+        assert_eq!(round, input);
+    }
+
+    #[test]
+    fn a_tool_result_serializes_with_its_error_flag() {
+        let block = ContentBlock::ToolResult {
+            tool_use_id: "toolu_01A".to_owned(),
+            content: "no index".to_owned(),
+            is_error: true,
+        };
+
+        assert_eq!(
+            serde_json::to_value(&block).unwrap(),
+            serde_json::json!({
+                "type": "tool_result",
+                "tool_use_id": "toolu_01A",
+                "content": "no index",
+                "is_error": true
+            })
+        );
+    }
+
+    // ContentBlock hand-writes `Deserialize`, so the arms the derive used to
+    // generate are now code like any other. The three tests below stand in for
+    // what the derive guaranteed for free.
+    #[test]
+    fn a_text_block_round_trips_byte_identically() {
+        let wire = r#"{"type":"text","text":"Use an LRU."}"#;
+
+        let block: ContentBlock = serde_json::from_str(wire).unwrap();
+        assert_eq!(block, ContentBlock::text("Use an LRU."));
+        assert_eq!(serde_json::to_string(&block).unwrap(), wire);
+    }
+
+    #[test]
+    fn a_block_of_an_unknown_type_is_refused() {
+        let wire = r#"{"type":"server_tool_use","id":"srvtoolu_01A"}"#;
+
+        let error = serde_json::from_str::<ContentBlock>(wire).unwrap_err();
+        assert!(
+            error.to_string().contains("unknown content block type"),
+            "unhelpful error: {error}"
+        );
+    }
+
+    #[test]
+    fn a_tool_call_without_its_input_is_refused() {
+        let wire = r#"{"type":"tool_use","id":"toolu_01A","name":"search_memory"}"#;
+
+        let error = serde_json::from_str::<ContentBlock>(wire).unwrap_err();
+        assert!(
+            error.to_string().contains("a tool_use block has no input"),
+            "unhelpful error: {error}"
+        );
     }
 
     #[test]

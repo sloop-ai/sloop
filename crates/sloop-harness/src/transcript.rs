@@ -11,10 +11,16 @@ use crate::tree::{ContentBlock, NodeId, Role, Tree};
 /// length of a response and state every idea considered, including ones
 /// abandoned a paragraph later, so indexing them would multiply the corpus
 /// while making a query match mid-derivation hedging.
+///
+/// Tool calls and their results share the arm but not the reasoning: what
+/// they look like in a transcript is not decided yet, and dropping them is
+/// what this function does until it is.
 fn text_of(block: &ContentBlock) -> Option<&str> {
     match block {
         ContentBlock::Text { text } => Some(text),
-        ContentBlock::Thinking { .. } => None,
+        ContentBlock::Thinking { .. }
+        | ContentBlock::ToolUse { .. }
+        | ContentBlock::ToolResult { .. } => None,
     }
 }
 

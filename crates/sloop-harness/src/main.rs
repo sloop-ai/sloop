@@ -245,11 +245,15 @@ fn fork_point(tree: &Tree, root: NodeId, first_branch: &[NodeId]) -> Result<(Nod
 /// Whether this node's block carries a signature bound to the prefix above it.
 ///
 /// The question [`fork_point`] asks of a candidate shared block, and the one
-/// place the two block kinds are not interchangeable.
+/// place thinking is not interchangeable with every other kind: it is the only
+/// one carrying a signature. Whether a fork may start below a tool call is a
+/// separate question, and the validity rule is what will answer it.
 fn signed(tree: &Tree, id: NodeId) -> Result<bool> {
     match tree.block(id).ok_or_else(rejected_id)? {
-        ContentBlock::Text { .. } => Ok(false),
         ContentBlock::Thinking { .. } => Ok(true),
+        ContentBlock::Text { .. }
+        | ContentBlock::ToolUse { .. }
+        | ContentBlock::ToolResult { .. } => Ok(false),
     }
 }
 
@@ -266,6 +270,8 @@ fn summarize(block: &ContentBlock) -> String {
             thinking,
             signature: _,
         } => ("thinking", thinking),
+        ContentBlock::ToolUse { name, .. } => ("tool_use", name),
+        ContentBlock::ToolResult { content, .. } => ("tool_result", content),
     };
     format!("  [{kind}] {}", text.lines().next().unwrap_or_default())
 }
