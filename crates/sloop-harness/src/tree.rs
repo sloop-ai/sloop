@@ -11,7 +11,7 @@
 //! [`Tree::replay`] reassembles blocks into messages, and [`Tree::prompt_for`]
 //! applies the prefill constraint on top.
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 /// A handle to one node of one [`Tree`].
 ///
@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 pub struct NodeId(u32);
 
 /// Who authored the turn a block belongs to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     User,
@@ -35,8 +35,8 @@ pub enum Role {
 /// thinking is on by default on the model this crate talks to, so a response
 /// contains one whether or not the caller asked.
 ///
-/// Only `Serialize` is derived. [`WireBlock`] carries the reason the other
-/// half cannot be.
+/// Serialized but never deserialized: blocks are built from stream deltas by
+/// `api::accumulate`, and the wire leg parses its own types rather than these.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
@@ -57,6 +57,10 @@ pub enum ContentBlock {
     /// and parsing then reserializing rewrites key order, escaping and number
     /// formatting in bytes the model produced. It is parsed at execution time,
     /// from a copy.
+    // Nothing outside the tests builds one yet: the decoder that will is the
+    // next piece of work. Hence not(test) -- under cfg(test) the variant is
+    // constructed and an expectation that held there would go unfulfilled.
+    #[cfg_attr(not(test), expect(dead_code, reason = "see above"))]
     ToolUse {
         id: String,
         name: String,
@@ -65,6 +69,9 @@ pub enum ContentBlock {
     },
     /// The answer to one call. A user block, though nothing in the type says
     /// so -- role lives on the node, and the validity rule is what enforces it.
+    // Built by the tool loop, which does not exist yet. See `ToolUse` above
+    // for why the attribute is conditional.
+    #[cfg_attr(not(test), expect(dead_code, reason = "see above"))]
     ToolResult {
         tool_use_id: String,
         content: String,
@@ -77,63 +84,6 @@ fn serialize_raw_json<S: serde::Serializer>(json: &str, serializer: S) -> Result
     let raw = serde_json::value::RawValue::from_string(json.to_owned())
         .map_err(serde::ser::Error::custom)?;
     raw.serialize(serializer)
-}
-
-/// Every field of every variant, all optional, with nothing chosen yet.
-///
-/// [`ContentBlock`] cannot derive `Deserialize`, and `input` is why. Serde's
-/// internally tagged representation buffers the whole map into a value of its
-/// own before it reads the tag and picks a variant, and that buffer is no
-/// longer JSON text: `RawValue` deserializes only straight from `serde_json`'s
-/// deserializer and rejects the buffer with "invalid type: newtype struct".
-/// A plain struct is not buffered, so `input` arrives here as the bytes that
-/// were on the wire -- which is the whole point of keeping it as text.
-#[derive(Deserialize)]
-struct WireBlock {
-    #[serde(rename = "type")]
-    kind: String,
-    text: Option<String>,
-    thinking: Option<String>,
-    signature: Option<String>,
-    id: Option<String>,
-    name: Option<String>,
-    input: Option<Box<serde_json::value::RawValue>>,
-    tool_use_id: Option<String>,
-    content: Option<String>,
-    is_error: Option<bool>,
-}
-
-/// A field the tag promised, or the error naming the one that is missing.
-fn required<T, E: serde::de::Error>(field: Option<T>, kind: &str, name: &str) -> Result<T, E> {
-    field.ok_or_else(|| E::custom(format!("a {kind} block has no {name}")))
-}
-
-impl<'de> Deserialize<'de> for ContentBlock {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let wire = WireBlock::deserialize(deserializer)?;
-        match wire.kind.as_str() {
-            "text" => Ok(Self::Text {
-                text: required(wire.text, "text", "text")?,
-            }),
-            "thinking" => Ok(Self::Thinking {
-                thinking: required(wire.thinking, "thinking", "thinking")?,
-                signature: required(wire.signature, "thinking", "signature")?,
-            }),
-            "tool_use" => Ok(Self::ToolUse {
-                id: required(wire.id, "tool_use", "id")?,
-                name: required(wire.name, "tool_use", "name")?,
-                input: required(wire.input, "tool_use", "input")?.get().to_owned(),
-            }),
-            "tool_result" => Ok(Self::ToolResult {
-                tool_use_id: required(wire.tool_use_id, "tool_result", "tool_use_id")?,
-                content: required(wire.content, "tool_result", "content")?,
-                is_error: required(wire.is_error, "tool_result", "is_error")?,
-            }),
-            other => Err(serde::de::Error::custom(format!(
-                "unknown content block type `{other}`"
-            ))),
-        }
-    }
 }
 
 impl ContentBlock {
@@ -190,7 +140,7 @@ impl Status {
 }
 
 /// One message of a `messages[]` array: a role and the blocks under it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Message {
     pub role: Role,
     pub content: Vec<ContentBlock>,
@@ -585,13 +535,13 @@ mod tests {
     }
 
     #[test]
-    fn a_thinking_block_round_trips_byte_identically() {
+    fn a_thinking_block_serializes_byte_identically() {
         // The signature binds the conversation prefix that produced the block.
-        // A representation that does not survive a round trip is rejected on the
-        // next turn, so this is the guarantee, not a serialization detail.
+        // A representation that does not reach the API unchanged is rejected on
+        // the next turn, so this is the guarantee, not a serialization detail.
         let wire = r#"{"type":"thinking","thinking":"Weighing LRU against TTL.","signature":"ErUBCkYIBRgCIkA="}"#;
+        let block = ContentBlock::thinking("Weighing LRU against TTL.", "ErUBCkYIBRgCIkA=");
 
-        let block: ContentBlock = serde_json::from_str(wire).unwrap();
         assert_eq!(serde_json::to_string(&block).unwrap(), wire);
     }
 
@@ -614,15 +564,12 @@ mod tests {
         );
     }
 
-    // The bytes, not the parse. A round trip that compared parsed values would
-    // pass against an implementation that reorders keys, and reordering is the
-    // one thing keeping the raw string exists to prevent.
+    // The bytes, not the parse. Asserting on a parsed value would pass against
+    // an implementation that reorders keys, and reordering is the one thing
+    // keeping the raw string exists to prevent -- so this looks for the input
+    // in the output as the exact substring it went in as.
     #[test]
-    #[expect(
-        clippy::panic,
-        reason = "the let-else has no value to assert on; the panic is the failure"
-    )]
-    fn a_tool_call_input_survives_a_round_trip_byte_for_byte() {
+    fn a_tool_call_serializes_its_input_byte_for_byte() {
         let input = r#"{"z":1,"a":{"nested":"  spaced  "}}"#;
         let block = ContentBlock::ToolUse {
             id: "toolu_01A".to_owned(),
@@ -631,13 +578,10 @@ mod tests {
         };
 
         let json = serde_json::to_string(&block).unwrap();
-        let back: ContentBlock = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(back, block);
-        let ContentBlock::ToolUse { input: round, .. } = back else {
-            panic!("a tool call deserialized as something else");
-        };
-        assert_eq!(round, input);
+        assert!(
+            json.contains(&format!(r#""input":{input}"#)),
+            "the input was reformatted on the way out: {json}"
+        );
     }
 
     #[test]
@@ -656,40 +600,6 @@ mod tests {
                 "content": "no index",
                 "is_error": true
             })
-        );
-    }
-
-    // ContentBlock hand-writes `Deserialize`, so the arms the derive used to
-    // generate are now code like any other. The three tests below stand in for
-    // what the derive guaranteed for free.
-    #[test]
-    fn a_text_block_round_trips_byte_identically() {
-        let wire = r#"{"type":"text","text":"Use an LRU."}"#;
-
-        let block: ContentBlock = serde_json::from_str(wire).unwrap();
-        assert_eq!(block, ContentBlock::text("Use an LRU."));
-        assert_eq!(serde_json::to_string(&block).unwrap(), wire);
-    }
-
-    #[test]
-    fn a_block_of_an_unknown_type_is_refused() {
-        let wire = r#"{"type":"server_tool_use","id":"srvtoolu_01A"}"#;
-
-        let error = serde_json::from_str::<ContentBlock>(wire).unwrap_err();
-        assert!(
-            error.to_string().contains("unknown content block type"),
-            "unhelpful error: {error}"
-        );
-    }
-
-    #[test]
-    fn a_tool_call_without_its_input_is_refused() {
-        let wire = r#"{"type":"tool_use","id":"toolu_01A","name":"search_memory"}"#;
-
-        let error = serde_json::from_str::<ContentBlock>(wire).unwrap_err();
-        assert!(
-            error.to_string().contains("a tool_use block has no input"),
-            "unhelpful error: {error}"
         );
     }
 

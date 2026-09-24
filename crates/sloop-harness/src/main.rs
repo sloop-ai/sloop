@@ -271,6 +271,9 @@ fn summarize(block: &ContentBlock) -> String {
             signature: _,
         } => ("thinking", thinking),
         ContentBlock::ToolUse { name, .. } => ("tool_use", name),
+        // Never reached. This runs once per *streamed* block, and the API
+        // streams no tool_result -- the harness builds those itself and
+        // appends them. The arm is here because the match must be exhaustive.
         ContentBlock::ToolResult { content, .. } => ("tool_result", content),
     };
     format!("  [{kind}] {}", text.lines().next().unwrap_or_default())
