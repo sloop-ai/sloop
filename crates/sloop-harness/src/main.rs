@@ -246,8 +246,9 @@ fn fork_point(tree: &Tree, root: NodeId, first_branch: &[NodeId]) -> Result<(Nod
 ///
 /// The question [`fork_point`] asks of a candidate shared block, and the one
 /// place thinking is not interchangeable with every other kind: it is the only
-/// one carrying a signature. Whether a fork may start below a tool call is a
-/// separate question, and the validity rule is what will answer it.
+/// one carrying a signature. Whether a `tool_use` may serve as a shared prefix
+/// block is a separate question, and Task 7 is what answers it, here in
+/// [`fork_point`] rather than in the validity rule that governs `append`.
 fn signed(tree: &Tree, id: NodeId) -> Result<bool> {
     match tree.block(id).ok_or_else(rejected_id)? {
         ContentBlock::Thinking { .. } => Ok(true),
@@ -425,6 +426,16 @@ mod tests {
         assert_eq!(
             summarize(&ContentBlock::thinking("weighing\nboth", "sig")),
             "  [thinking] weighing".to_owned()
+        );
+        // A call is named by its tool, not its input: the input is JSON on one
+        // line, so summarizing by it would print the whole argument blob.
+        assert_eq!(
+            summarize(&ContentBlock::ToolUse {
+                id: "toolu_01A".to_owned(),
+                name: "search_memory".to_owned(),
+                input: r#"{"query":"cache expiry"}"#.to_owned(),
+            }),
+            "  [tool_use] search_memory".to_owned()
         );
     }
 

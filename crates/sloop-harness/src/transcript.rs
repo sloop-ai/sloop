@@ -499,6 +499,54 @@ captured: 2026-09-13
         );
     }
 
+    /// A tool result reaches the model and never the corpus.
+    ///
+    /// Same shape as the thinking test above, and for a stronger reason: the
+    /// payload is derived content, so a copy of it in the index competes with
+    /// whatever it was derived from. Comparing the whole document is what
+    /// catches it leaving a blank paragraph behind rather than nothing.
+    #[test]
+    fn a_tool_result_leaves_no_trace() {
+        let mut tree = Tree::new(ContentBlock::text("How should the cache expire?"));
+        let root = tree.root();
+        let result = tree
+            .append(
+                root,
+                Role::User,
+                ContentBlock::ToolResult {
+                    tool_use_id: "toolu_01A".to_owned(),
+                    content: "3 hits: cache.md, ttl.md, lru.md".to_owned(),
+                    is_error: false,
+                },
+            )
+            .unwrap();
+        let tip = tree
+            .append(
+                result,
+                Role::Assistant,
+                ContentBlock::text("Expire on write."),
+            )
+            .unwrap();
+
+        assert_eq!(
+            render(&tree, tip, "2026-09-13").unwrap(),
+            "\
+---
+type: transcript
+captured: 2026-09-13
+---
+
+# How should the cache expire?
+
+## Turn 1
+
+**user:** How should the cache expire?
+
+**assistant:** Expire on write.
+"
+        );
+    }
+
     /// The aside has to follow the abandoned branch to its own end.
     ///
     /// Stopping at the divergence would quote the rejected proposal without

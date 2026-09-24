@@ -89,7 +89,21 @@ pub enum ContentBlock {
     },
 }
 
-/// Emit the stored JSON text as JSON rather than as a quoted string.
+/// Emit the stored text as JSON rather than as the string it is held in.
+///
+/// Serializing the `String` directly would send the API a quoted blob where it
+/// requires an object, so the text is handed to a [`RawValue`], which is the
+/// one wrapper that writes bytes through untouched. Parsing to a `Value` and
+/// serializing that would also produce an object, and is what the raw text
+/// exists to avoid.
+///
+/// `from_string` re-parses rather than trusting the caller, which is what
+/// keeps a malformed input from tearing a hole in a body the API would then
+/// reject for reasons of its own. What comes back is the parser's own error
+/// -- "EOF while parsing an object at line 1 column 1" and the like -- and it
+/// names neither the block nor the tool, so the turn is the unit to look at.
+///
+/// [`RawValue`]: serde_json::value::RawValue
 fn serialize_raw_json<S: serde::Serializer>(json: &str, serializer: S) -> Result<S::Ok, S::Error> {
     let raw = serde_json::value::RawValue::from_string(json.to_owned())
         .map_err(serde::ser::Error::custom)?;
@@ -393,6 +407,11 @@ mod tests {
     /// against string literals, so what they are checking is which blocks
     /// landed on a branch, not what kind they are. Anything that turns on a
     /// signature has to compare the blocks themselves.
+    ///
+    /// A tool call stands for itself by name and a result by its content, on
+    /// the same reasoning: a branch is identified by what landed on it, and
+    /// those are the only strings either variant has that a test would think
+    /// to write down.
     fn prose(messages: &[Message]) -> Vec<String> {
         let mut out = Vec::new();
         for message in messages {
