@@ -12,9 +12,20 @@ use crate::tree::{ContentBlock, NodeId, Role, Tree};
 /// abandoned a paragraph later, so indexing them would multiply the corpus
 /// while making a query match mid-derivation hedging.
 ///
-/// Tool calls and their results share the arm but not the reasoning: what
-/// they look like in a transcript is not decided yet, and dropping them is
-/// what this function does until it is.
+/// Tool calls and their results share the arm today but go opposite ways. A
+/// `tool_use` is worth retrieving -- that the memory was consulted, and what
+/// was asked of it -- and gets a constructed line naming the tool and its
+/// input, which is what will move this signature to `Option<Cow<'_, str>>`.
+///
+/// A `tool_result` is dropped for good, and on general grounds rather than
+/// anything true of one tool: a result is derived content. It came from
+/// somewhere already indexed, where the copy competes with the note it came
+/// from and beats it on nothing, having no frontmatter, no links and a
+/// `heading_path` from the wrong document -- or from somewhere that is not
+/// this harness's to index at all. Deciding that per tool would couple this
+/// function to every tool's result schema; deciding it once for the category
+/// does not. What survives into the index is whatever the assistant concluded
+/// from the payload, which is a conclusion rather than a copy.
 fn text_of(block: &ContentBlock) -> Option<&str> {
     match block {
         ContentBlock::Text { text } => Some(text),

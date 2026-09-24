@@ -50,16 +50,25 @@ pub enum ContentBlock {
         thinking: String,
         signature: String,
     },
-    /// A call the model wants made.
+    /// A call the model wants made. `input` holds one well-formed JSON object.
     ///
-    /// `input` is the JSON text the deltas delivered, kept verbatim for the
-    /// reason `signature` is: this block travels back in every later request,
-    /// and parsing then reserializing rewrites key order, escaping and number
-    /// formatting in bytes the model produced. It is parsed at execution time,
-    /// from a copy.
+    /// It is the JSON text the deltas delivered, kept as text for the reason
+    /// `signature` is: this block travels back in every later request, and
+    /// parsing then reserializing rewrites key order, escaping and number
+    /// formatting in bytes the model produced. It is parsed at execution
+    /// time, from a copy.
+    ///
+    /// Serializing re-parses, so malformed text fails the request rather than
+    /// corrupting it. Only well-formedness is checked, though: `42` and `"hi"`
+    /// serialize happily into a field the API requires to be an object, and
+    /// that 400 arrives from the far end. Surrounding whitespace is trimmed on
+    /// the way out, so it is the interior bytes that are preserved.
     // Nothing outside the tests builds one yet: the decoder that will is the
     // next piece of work. Hence not(test) -- under cfg(test) the variant is
     // constructed and an expectation that held there would go unfulfilled.
+    // Unlike the constructor's attribute below, this one will not expire on
+    // its own: expect(dead_code) self-cleans on a function but stays silent on
+    // a variant that becomes live. Task 3 step 3b deletes it by name.
     #[cfg_attr(not(test), expect(dead_code, reason = "see above"))]
     ToolUse {
         id: String,
@@ -70,7 +79,8 @@ pub enum ContentBlock {
     /// The answer to one call. A user block, though nothing in the type says
     /// so -- role lives on the node, and the validity rule is what enforces it.
     // Built by the tool loop, which does not exist yet. See `ToolUse` above
-    // for why the attribute is conditional.
+    // for why the attribute is conditional and why it cannot expire on its
+    // own. Task 9 is the one that deletes this copy by name.
     #[cfg_attr(not(test), expect(dead_code, reason = "see above"))]
     ToolResult {
         tool_use_id: String,
@@ -568,9 +578,14 @@ mod tests {
     // an implementation that reorders keys, and reordering is the one thing
     // keeping the raw string exists to prevent -- so this looks for the input
     // in the output as the exact substring it went in as.
+    //
+    // The fixture carries one of each thing the variant's doc claims is
+    // preserved: key order, interior whitespace, an escape a parse would
+    // resolve (`\u0041` to `A`), a number a parse would reformat (`1e5` to
+    // `100000.0`), and a float that must not come back as `1`.
     #[test]
     fn a_tool_call_serializes_its_input_byte_for_byte() {
-        let input = r#"{"z":1,"a":{"nested":"  spaced  "}}"#;
+        let input = r#"{"z":1e5,"a":{"nested":"  spaced  "},"esc":"\u0041","big":1.0}"#;
         let block = ContentBlock::ToolUse {
             id: "toolu_01A".to_owned(),
             name: "search_memory".to_owned(),
@@ -582,6 +597,26 @@ mod tests {
             json.contains(&format!(r#""input":{input}"#)),
             "the input was reformatted on the way out: {json}"
         );
+    }
+
+    // Serializing re-parses, and that is the only check standing between a
+    // malformed input and a request body with a hole in it. Without this, an
+    // implementation that swallowed the parse error and emitted `null` in its
+    // place passes every other test in the file.
+    #[test]
+    fn a_tool_call_with_a_malformed_input_fails_to_serialize() {
+        for input in ["", "{", r#"{"query":}"#] {
+            let block = ContentBlock::ToolUse {
+                id: "toolu_01A".to_owned(),
+                name: "search_memory".to_owned(),
+                input: input.to_owned(),
+            };
+
+            assert!(
+                serde_json::to_string(&block).is_err(),
+                "`{input}` serialized into a request body"
+            );
+        }
     }
 
     #[test]
@@ -599,6 +634,27 @@ mod tests {
                 "tool_use_id": "toolu_01A",
                 "content": "no index",
                 "is_error": true
+            })
+        );
+    }
+
+    // The false case is the one a `skip_serializing_if` would quietly drop,
+    // and a dropped flag reads as a successful call at the far end.
+    #[test]
+    fn a_tool_result_that_succeeded_still_carries_the_flag() {
+        let block = ContentBlock::ToolResult {
+            tool_use_id: "toolu_01A".to_owned(),
+            content: "3 hits".to_owned(),
+            is_error: false,
+        };
+
+        assert_eq!(
+            serde_json::to_value(&block).unwrap(),
+            serde_json::json!({
+                "type": "tool_result",
+                "tool_use_id": "toolu_01A",
+                "content": "3 hits",
+                "is_error": false
             })
         );
     }
