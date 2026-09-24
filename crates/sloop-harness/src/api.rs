@@ -91,6 +91,10 @@ pub struct ToolDefinition {
 }
 
 /// Whether the model may call a tool, must, or must not.
+///
+/// Three of the wire's four: `any` -- call something, no matter what -- is
+/// left out because nothing here wants it, not because it was missed. This is
+/// the set of choices this harness makes, not a picture of the API.
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ToolChoice {
@@ -99,13 +103,12 @@ pub enum ToolChoice {
     // sends `Auto` and goes on doing so until it starts calling tools. Hence
     // not(test), matching the tree's unbuilt variants -- under cfg(test) they
     // are constructed and an expectation that held there would itself go
-    // unfulfilled. Neither attribute expires on its own, so whichever task
-    // first forces or forbids a call deletes the one it makes live.
+    // unfulfilled.
     //
-    // `None` is the arm with no task waiting for it. It is here because the
-    // three together are what "may, must, must not" means, and an enum that
-    // could not say the third would send `tools` with no way to stop the
-    // model reaching for them.
+    // Both go live together. The scripted turn that forces a call with `Tool`
+    // is followed by one that forbids a call with `None`, which is what makes
+    // the second turn terminal text rather than a third request. Neither
+    // attribute expires on its own, so that task deletes both by hand.
     #[cfg_attr(not(test), expect(dead_code, reason = "see above"))]
     None,
     #[cfg_attr(not(test), expect(dead_code, reason = "see above"))]
