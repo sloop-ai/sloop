@@ -11,7 +11,7 @@ workspace = true
 [dependencies]
 # LanceDB's default feature set is empty, which keeps its optional candle/hf-hub
 # embedding stack out of the tree -- we do our own inference via ort.
-lancedb = "0.37"
+lancedb = "0.40"
 # Must track the arrow major that lancedb is built against, for the same
 # reason lance-index is pinned below: two arrow versions in the tree give
 # RecordBatch two distinct identities and every conversion stops compiling.
@@ -20,11 +20,11 @@ arrow = "58"
 arrow-schema = "58"
 # FullTextSearchQuery is not re-exported by lancedb, so this comes in directly.
 # Version must track lancedb's own `=10.0.0` pin exactly or the types diverge.
-lance-index = "=10.0.0"
+lance-index = "=13.0.0"
 
 # load-dynamic dlopens libonnxruntime at runtime rather than linking it, so the
 # build needs no C++ toolchain and nix can point ORT_DYLIB_PATH at its own copy.
-ort = { version = "=2.0.0-rc.13", default-features = false, features = ["load-dynamic"] }
+ort = { version = "=2.0.0-rc.14", default-features = false, features = ["load-dynamic"] }
 # A regex backend is mandatory even for WordPiece models like bge; fancy-regex is
 # the pure-Rust one, so this stays free of the onig C dependency.
 tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
