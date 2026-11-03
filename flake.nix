@@ -60,15 +60,13 @@
             # safe. rust-toolchain.toml is excluded too: the compiler comes
             # from makeRustPlatform, and cargo would only read that file
             # through a rustup shim that does not exist in the sandbox.
-            # .sse files are the harness's recorded SSE fixtures. The tests
-            # that read them run in this sandbox, so they have to be here.
             src = nixpkgs.lib.fileset.toSource {
               root = ./.;
               fileset = nixpkgs.lib.fileset.unions [
                 ./Cargo.toml
                 ./Cargo.lock
                 (nixpkgs.lib.fileset.fileFilter
-                  (f: f.hasExt "rs" || f.hasExt "sse" || f.name == "Cargo.toml")
+                  (f: f.hasExt "rs" || f.name == "Cargo.toml")
                   ./crates)
               ];
             };
@@ -90,7 +88,7 @@
             # It validates the vendor derivation's own output hash and passes
             # while the package build is broken. Only the full package build
             # runs the hook that compares the two lock files.
-            cargoHash = "sha256-xKeJw8wbdgXIIaUl7NcRn3zG/zIqL3wan/rZ6z1kc48=";
+            cargoHash = "sha256-WIHI5Toufu5QAb0utyPwuYjMuV874fS2ktBjpl6Ibx4=";
             cargoBuildFlags = [ "-p" "sloop-memory" ];
 
             # protoc is build-time codegen for lance-encoding's .proto files,

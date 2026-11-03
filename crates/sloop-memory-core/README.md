@@ -5,10 +5,9 @@ search, plus the socket protocol and client that [`sloop-memory`](../sloop-memor
 wraps in a daemon.
 
 It is a separate crate so a consumer can link it and call it in-process rather
-than standing up a daemon and talking to it over a Unix socket.
-[`sloop-harness`](../sloop-harness) does that. Everything that talks to the
-outside world -- the daemon, the filesystem watcher, the MCP server, the CLI,
-the hook -- lives in `sloop-memory` instead.
+than standing up a daemon and talking to it over a Unix socket. Everything that
+talks to the outside world -- the daemon, the filesystem watcher, the MCP
+server, the CLI, the hook -- lives in `sloop-memory` instead.
 
 Chunks from every configured root share one LanceDB table, `chunks`,
 distinguished by `source_type`/`source_id` rather than by a table per root.

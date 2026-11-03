@@ -1,7 +1,6 @@
 [workspace]
 members = [
   "crates/sloop-memory-core",
-  "crates/sloop-harness",
   "crates/sloop-memory",
 ]
 resolver = "2"

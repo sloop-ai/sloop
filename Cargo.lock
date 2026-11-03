@@ -5159,22 +5159,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
-name = "sloop-harness"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "futures",
- "proptest",
- "reqwest",
- "serde",
- "serde_json",
- "sloop-memory-core",
- "tempfile",
- "tokio",
-]
-
-[[package]]
 name = "sloop-memory"
 version = "0.1.0"
 dependencies = [
