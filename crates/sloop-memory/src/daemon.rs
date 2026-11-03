@@ -45,8 +45,7 @@ struct RecallResult {
 ///
 /// Takes label/path pairs rather than `config::Roots` because a `config::Root`
 /// cannot be built outside `sloop-memory-core`, so a test would otherwise need
-/// the filesystem and the process environment to construct one. See
-/// `sloop-harness`'s `transcript_dir` for the same trade.
+/// the filesystem and the process environment to construct one.
 fn consolidate(hits: Vec<store::Hit>, roots: &[(&str, &Path)]) -> Vec<Pointer> {
     let mut best: Vec<Pointer> = Vec::new();
     for h in hits
@@ -536,22 +535,22 @@ mod tests {
             .collect()
     }
 
-    // Transcripts are voluminous next to notes -- one session outweighs anything
-    // written down deliberately -- so a global sort by cosine hands every slot to
+    // Roots differ wildly in volume -- an exported wiki outweighs anything written
+    // down deliberately -- so a global sort by cosine hands every slot to
     // whichever root is wordiest. Round-robin bounds that without a ranking model.
     #[test]
     fn no_single_root_takes_every_pointer_slot() {
         let hits = vec![
-            pointer("transcripts", 0.95),
-            pointer("transcripts", 0.94),
-            pointer("transcripts", 0.93),
+            pointer("wiki", 0.95),
+            pointer("wiki", 0.94),
+            pointer("wiki", 0.93),
             pointer("notes", 0.80),
         ];
 
         let picked = take_round_robin(hits, 3);
         let labels: Vec<&str> = picked.iter().map(|p| p.source_type.as_str()).collect();
 
-        assert_eq!(labels, vec!["transcripts", "notes", "transcripts"]);
+        assert_eq!(labels, vec!["wiki", "notes", "wiki"]);
     }
 
     #[test]
@@ -571,9 +570,9 @@ mod tests {
     #[test]
     fn every_root_gets_a_slot_before_any_root_gets_a_second() {
         let hits = vec![
-            pointer("transcripts", 0.95),
-            pointer("transcripts", 0.90),
-            pointer("transcripts", 0.85),
+            pointer("wiki", 0.95),
+            pointer("wiki", 0.90),
+            pointer("wiki", 0.85),
             pointer("notes", 0.80),
             pointer("notes", 0.70),
             pointer("memory", 0.60),
@@ -584,10 +583,10 @@ mod tests {
         assert_eq!(
             labelled(&picked),
             vec![
-                ("transcripts", 0.95),
+                ("wiki", 0.95),
                 ("notes", 0.80),
                 ("memory", 0.60),
-                ("transcripts", 0.90),
+                ("wiki", 0.90),
                 ("notes", 0.70),
             ]
         );
@@ -600,9 +599,9 @@ mod tests {
     fn a_roots_own_hits_stay_in_descending_cosine_order() {
         let hits = vec![
             pointer("notes", 0.40),
-            pointer("transcripts", 0.99),
+            pointer("wiki", 0.99),
             pointer("notes", 0.90),
-            pointer("transcripts", 0.10),
+            pointer("wiki", 0.10),
             pointer("notes", 0.65),
         ];
 
@@ -611,9 +610,9 @@ mod tests {
         assert_eq!(
             labelled(&picked),
             vec![
-                ("transcripts", 0.99),
+                ("wiki", 0.99),
                 ("notes", 0.90),
-                ("transcripts", 0.10),
+                ("wiki", 0.10),
                 ("notes", 0.65),
                 ("notes", 0.40),
             ]
@@ -625,18 +624,15 @@ mod tests {
     #[test]
     fn the_limit_cuts_part_way_through_a_round() {
         let hits = vec![
-            pointer("transcripts", 0.95),
+            pointer("wiki", 0.95),
             pointer("notes", 0.80),
             pointer("memory", 0.60),
-            pointer("transcripts", 0.90),
+            pointer("wiki", 0.90),
         ];
 
         let picked = take_round_robin(hits, 2);
 
-        assert_eq!(
-            labelled(&picked),
-            vec![("transcripts", 0.95), ("notes", 0.80)]
-        );
+        assert_eq!(labelled(&picked), vec![("wiki", 0.95), ("notes", 0.80)]);
     }
 
     /// Nothing above threshold is the ordinary case for an unrelated prompt;
