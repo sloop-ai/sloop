@@ -62,7 +62,12 @@ impl Embedder {
         // ort's builder errors hand the builder back inside the error, which makes
         // them !Send and so not convertible into anyhow::Error by `?`. Flatten to
         // a message at each step instead.
-        let session = Session::builder()
+        // The session holds its own clone of the environment, so this one can
+        // drop at the end of the function.
+        let environment = ort::init()
+            .build()
+            .map_err(|e| anyhow!("creating ort environment: {e}"))?;
+        let session = Session::builder(&environment)
             .map_err(|e| anyhow!("creating ort session builder: {e}"))?
             .with_optimization_level(GraphOptimizationLevel::Level3)
             .map_err(|e| anyhow!("setting graph optimization level: {e}"))?
