@@ -17,40 +17,20 @@ the agent works out from. Nothing leaves the machine.
 
 ## The loop
 
-`sloop-memory` handles the retrieval half, and works today. Every prompt is
-embedded and matched against the indexed roots; anything clearing a cosine
-threshold is surfaced as a pointer before the model sees the turn. The trigger
-is mechanical rather than a judgment call about whether a question "sounds like"
-it needs the notes -- that kind of trigger fails silently on questions that do
-not announce themselves.  This is deliberately separate so it can be embedded
-into any harness.
+`sloop-memory` handles the retrieval half. Every prompt is embedded and matched
+against the indexed roots; anything clearing a cosine threshold is surfaced as a
+pointer before the model sees the turn. The trigger is mechanical rather than a
+judgment call about whether a question "sounds like" it needs the notes -- that
+kind of trigger fails silently on questions that do not announce themselves.
 
-`sloop-harness` handles the other half. It holds a conversation as a tree of
-content blocks, streams turns into it from the Messages API, forks a branch at
-a block boundary and regenerates it -- and writes the whole session as markdown
-into a root the daemon already watches. Four seconds later it is retrievable.
-Nothing else connects them: the harness writes a file, the watcher indexes it,
-and the daemon stays the only writer to the index.
+The write half is whatever the agent and its user already keep: a notes vault,
+or the memory directory a harness writes between sessions. Point a root at it
+and the daemon's filesystem watcher indexes each change within seconds. The
+daemon stays the only writer to the index.
 
-Feeding a transcript back is only safe if a rejected idea cannot come back as a
-fact. This project spent a while believing the answer was a kept / abandoned
-label on every node, and that turned out to be wrong. The unsafety was never
-the missing label; it was stripping a block out of its context and presenting
-it as an assertion. A label is metadata, the text is what gets read, and every
-consumer has to remember to join them.
-
-What replaces it is structural, and it is cheaper. A branch that was tried and
-dropped renders under a `### Not continued` heading, and the chunker turns
-headings into the `heading_path` it carries on every chunk. That path goes into
-the pointer the prompt hook injects, and into the text that gets embedded and
-matched. So a hit inside a discarded branch says so in every retrieval path,
-and no code has to remember to make it say so. The heading is the label, and it
-cannot be stripped by a renderer that forgets it exists.
-
-The tree keeps its kept / abandoned labels for the harness's own use -- which
-branch is live, what to display -- and the indexer does not read them.
-[`docs/plans/2026-09-13-transcript-indexing-design.md`](docs/plans/2026-09-13-transcript-indexing-design.md)
-records the argument, including what was tried first.
+It is deliberately not tied to one harness. The daemon is reached through an MCP
+server, which any MCP client can launch, a CLI, and a prompt hook for Claude
+Code.
 
 ## The parts
 
@@ -58,20 +38,16 @@ records the argument, including what was tried first.
 |---|---|
 | [`sloop-memory-core`](crates/sloop-memory-core) | Library. Chunking, embedding, index building, hybrid retrieval, and the daemon's socket protocol. |
 | [`sloop-memory`](crates/sloop-memory) | Binary. A resident daemon with a filesystem watcher, an MCP server, a CLI, and a Claude Code prompt hook. |
-| [`sloop-harness`](crates/sloop-harness) | Binary. A branching agent harness over the Anthropic Messages API. Holds the conversation tree, streams turns into it, and writes each session to the `transcripts` root for the daemon to index. No tools yet. |
 
 The library/binary split exists so a consumer can link the engine directly and
 call it in-process instead of standing up a daemon and talking to it over a Unix
-socket. `sloop-harness` does exactly that. The daemon is one way to use the
-engine, not the only way.
+socket. The daemon is one way to use the engine, not the only way.
 
 Each crate's README covers its own surface: `sloop-memory-core` for how
 retrieval works and what it costs, `sloop-memory` for configuration, the CLI,
 the MCP tools and the hook.
 
 ## Install
-
-`sloop-memory` is the part that works today:
 
     nix profile install github:sloop-ai/sloop#sloop-memory
     export SLOOP_MEMORY_ROOTS="notes=$HOME/notes"

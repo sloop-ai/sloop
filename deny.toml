@@ -10,6 +10,10 @@ ignore = [
   # transitively by the lance/datafusion tree, so we cannot drop it without
   # dropping them. Revisit when those trees stop depending on it.
   "RUSTSEC-2024-0436",
+  # `unsafe-libyaml` is unmaintained, not vulnerable. lance-tokenizer pulls it
+  # in through lindera's serde_yaml_ng, and lance-index is pinned `=10.0.0`, so
+  # it leaves with a lance major that drops it.
+  "RUSTSEC-2024-0449",
 ]
 
 [licenses]
