@@ -33,7 +33,7 @@ jobs:
 
       # Caches ~/.cargo and target/. The nix store itself comes from
       # cache.nixos.org, so only the crate graph is worth caching here.
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: cargo fmt
         run: nix develop -c cargo fmt --check
